@@ -4,10 +4,11 @@ This is a Tauri-based desktop application for downloading audio from YouTube. It
 
 ## Features
 
-- Download individual YouTube videos or entire playlists as audio files.
-- Save audio files in MP3 format with high quality (320K).
-- Select and save a custom download path.
-- Automatically installs `yt-dlp` if it is not already installed.
+- Download individual YouTube videos or entire playlists as audio files
+- Save audio files in MP3 format with high quality (320K)
+- Select and save a custom download path
+- Automatically installs `yt-dlp` if it is not already installed
+- Cross-platform support (Windows, macOS, Linux)
 
 ## Prerequisites
 
@@ -21,43 +22,77 @@ Before setting up the project, ensure you have the following installed:
 
 1. Clone the repository:
    ```sh
-   git clone <repository-url>
+   git clone https://github.com/yourusername/ytdownloader.git
    cd ytdownloader
+   ```
 
-2. Install the Node.js dependencies: npm install
+2. Install the Node.js dependencies:
+   ```sh
+   npm install
+   ```
 
-3. Install Rust dependencies (if not already installed): rustup update
+3. Install Rust dependencies:
+   ```sh
+   rustup update
+   ```
 
-4. Ensure yt-dlp is installed. The app will attempt to install it automatically if it is missing.
+## Development
 
-Development
-To run the app in development mode:
+Run the app in development mode:
+```sh
+npm run dev
+```
 
-1. Start the development server: npm run dev
-2. This will start the Vite development server and the Tauri backend. The app will be available at http://localhost:1420.
+This will start both the Vite development server and the Tauri backend. The app will be available at `http://localhost:1420`.
 
-Build
-To build the app for production:
+## Building for Production
 
-1. Run the build command: npm run build
-2. This will create a production-ready build of the app in the dist directory.
-3. To package the app as a desktop application, run: npm run tauri build
+1. Create a production build:
+   ```sh
+   npm run build
+   ```
 
-The packaged app will be available in the src-tauri/target/release directory.
+2. Package the app:
+   ```sh
+   npm run tauri build
+   ```
 
-Running the App
-After building the app, you can run it directly:
+The packaged application will be available in:
+- Linux: `src-tauri/target/release/ytdownloader`
+- Windows: `src-tauri/target/release/ytdownloader.exe`
+- macOS: `src-tauri/target/release/ytdownloader.app`
 
-1. Navigate to the release directory: cd src-tauri/target/release
+## Development Environment
 
-2. Run the executable: ./ytdownloader
+### Recommended IDE Setup
+- [Visual Studio Code](https://code.visualstudio.com/) with extensions:
+  - [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode)
+  - [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+  - [TypeScript and JavaScript](https://marketplace.visualstudio.com/items?itemName=ms-vscode.vscode-typescript-next)
 
-Recommended IDE Setup
-VS Code with the following extensions:
-Tauri
-Rust Analyzer
-License
-This project is licensed under the MIT License.
+### Project Structure
+```
+ytdownloader/
+├── src/                 # React frontend source
+├── src-tauri/          # Rust backend source
+├── public/             # Static assets
+└── package.json        # Project configuration
+```
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## Contributing
+
+1. Fork the repository
+2. Create a new branch
+3. Make your changes
+4. Submit a pull request
+
+## Support
+
+If you encounter any issues or have questions, please file an issue on the GitHub repository.
 
 
 
