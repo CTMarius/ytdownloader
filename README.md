@@ -1,13 +1,24 @@
-# YouTube Audio Downloader
+# YouTube & Podcast Audio Downloader
 
-This is a Tauri-based desktop application for downloading audio from YouTube. It uses `yt-dlp` under the hood to handle the downloading process. The app is built with React, TypeScript, and Vite for the frontend, and Rust for the backend.
+This is a Tauri-based desktop application for downloading audio from YouTube and public podcast RSS feeds. It uses `yt-dlp` under the hood to handle downloads. The app is built with React, TypeScript, and Vite for the frontend, and Rust for the backend.
 
 ## Features
 
 - Download individual YouTube videos or entire playlists as audio files
+- Download every available episode from a public podcast RSS feed
 - Save audio files in MP3 format with high quality (320K)
 - Select and save a custom download path
 - Cross-platform support (Windows, macOS, Linux)
+
+## Downloading a podcast RSS feed
+
+1. Choose **Podcast RSS feed** in the Download section.
+2. Paste a public `http` or `https` RSS feed URL.
+3. Choose the parent download destination and select **Download podcast**.
+
+The app asks `yt-dlp` to verify that the URL is an episode playlist, derives a safe folder name from the podcast title, and creates that folder inside the selected destination. All available episodes are saved there. The status area shows the current episode when `yt-dlp` reports progress.
+
+Feeds that require authentication, are not recognized by `yt-dlp` as a playlist, or contain no downloadable episodes are rejected before the full download begins. Very large feeds can take a long time and may leave already completed episodes in the podcast folder if a later episode fails.
 
 ## Prerequisites
 
@@ -95,7 +106,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## Support
 
 If you encounter any issues or have questions, please file an issue on the GitHub repository.
-
 
 
 

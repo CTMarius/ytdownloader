@@ -1,9 +1,10 @@
 import { FormEvent, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import { listen } from "@tauri-apps/api/event";
 import "./App.css";
 
-type DownloadType = "single" | "playlist";
+type DownloadType = "single" | "playlist" | "podcast";
 type NoticeTone = "neutral" | "success" | "error";
 
 interface InstallationStatus {
@@ -19,6 +20,12 @@ interface Notice {
   tone: NoticeTone;
 }
 
+interface PodcastProgress {
+  current: number;
+  total: number;
+  percent: string;
+}
+
 const YOUTUBE_HOSTS = ["youtube.com", "youtu.be", "youtube-nocookie.com"];
 
 function isYouTubeUrl(value: string): boolean {
@@ -31,6 +38,18 @@ function isYouTubeUrl(value: string): boolean {
       YOUTUBE_HOSTS.some(
         (allowedHost) => host === allowedHost || host.endsWith(`.${allowedHost}`),
       )
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isHttpUrl(value: string): boolean {
+  try {
+    const parsedUrl = new URL(value.trim());
+    return (
+      (parsedUrl.protocol === "https:" || parsedUrl.protocol === "http:") &&
+      Boolean(parsedUrl.hostname)
     );
   } catch {
     return false;
@@ -62,7 +81,7 @@ function App() {
     tone: "neutral",
   });
   const [notice, setNotice] = useState<Notice>({
-    message: "Choose a YouTube link and a destination to get started.",
+    message: "Choose a YouTube link or podcast feed and a destination to get started.",
     tone: "neutral",
   });
 
@@ -104,6 +123,42 @@ function App() {
 
     return () => {
       cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+
+    void listen<PodcastProgress>("podcast-download-progress", (event) => {
+      const { current, total, percent } = event.payload;
+      if (current > 0 && total > 0) {
+        const progress = percent ? ` (${percent})` : "";
+        setNotice({
+          message: `Downloading podcast episode ${current} of ${total}${progress}…`,
+          tone: "neutral",
+        });
+      }
+    })
+      .then((stopListening) => {
+        if (disposed) {
+          stopListening();
+        } else {
+          unlisten = stopListening;
+        }
+      })
+      .catch(() => {
+        if (!disposed) {
+          setNotice({
+            message: "Podcast download progress is unavailable, but downloads can still run.",
+            tone: "neutral",
+          });
+        }
+      });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
     };
   }, []);
 
@@ -162,13 +217,27 @@ function App() {
     const trimmedPath = downloadPath.trim();
 
     if (!trimmedUrl) {
-      setNotice({ message: "Enter a YouTube video or playlist URL.", tone: "error" });
+      setNotice({
+        message:
+          downloadType === "podcast"
+            ? "Enter a podcast RSS feed URL."
+            : "Enter a YouTube video or playlist URL.",
+        tone: "error",
+      });
       return;
     }
 
-    if (!isYouTubeUrl(trimmedUrl)) {
+    if (downloadType !== "podcast" && !isYouTubeUrl(trimmedUrl)) {
       setNotice({
         message: "Enter a valid http(s) URL from YouTube or youtu.be.",
+        tone: "error",
+      });
+      return;
+    }
+
+    if (downloadType === "podcast" && !isHttpUrl(trimmedUrl)) {
+      setNotice({
+        message: "Enter a valid http(s) podcast RSS feed URL.",
         tone: "error",
       });
       return;
@@ -191,14 +260,26 @@ function App() {
     }
 
     setIsDownloading(true);
-    setNotice({ message: "Downloading audio. This can take a few minutes…", tone: "neutral" });
+    setNotice({
+      message:
+        downloadType === "podcast"
+          ? "Checking the podcast feed and preparing its folder…"
+          : "Downloading audio. This can take a few minutes…",
+      tone: "neutral",
+    });
 
     try {
-      const result = await invoke<DownloadResult>("download_audio", {
-        url: trimmedUrl,
-        downloadType,
-        path: trimmedPath,
-      });
+      const result =
+        downloadType === "podcast"
+          ? await invoke<DownloadResult>("download_podcast", {
+              url: trimmedUrl,
+              path: trimmedPath,
+            })
+          : await invoke<DownloadResult>("download_audio", {
+              url: trimmedUrl,
+              downloadType,
+              path: trimmedPath,
+            });
       setNotice({ message: result.message, tone: "success" });
     } catch (error) {
       setNotice({
@@ -213,6 +294,7 @@ function App() {
   const isInitializing = isCheckingInstallation || isLoadingPath;
   const downloadUnavailable =
     isInitializing || isSelectingPath || isDownloading || toolStatus.tone !== "success";
+  const isPodcast = downloadType === "podcast";
 
   return (
     <main className="app-shell">
@@ -226,9 +308,9 @@ function App() {
           </div>
           <div>
             <p className="eyebrow">Audio downloader</p>
-            <h1 id="app-title">YouTube to MP3</h1>
+            <h1 id="app-title">Audio to MP3</h1>
           </div>
-          <p className="intro">Save a video or playlist as high-quality MP3 files.</p>
+          <p className="intro">Save YouTube videos, playlists, or podcast feeds as high-quality MP3 files.</p>
         </header>
 
         <div className={`tool-status ${toolStatus.tone}`} aria-live="polite">
@@ -248,22 +330,28 @@ function App() {
 
         <form noValidate onSubmit={handleDownload}>
           <div className="field">
-            <label htmlFor="youtube-url">YouTube URL</label>
+            <label htmlFor="source-url">{isPodcast ? "Podcast RSS feed URL" : "YouTube URL"}</label>
             <input
-              id="youtube-url"
-              name="youtube-url"
+              id="source-url"
+              name="source-url"
               type="url"
               inputMode="url"
               autoComplete="url"
               value={url}
               onChange={(event) => setUrl(event.target.value)}
-              placeholder="https://www.youtube.com/watch?v=…"
+              placeholder={
+                isPodcast
+                  ? "https://example.com/podcast.rss"
+                  : "https://www.youtube.com/watch?v=…"
+              }
               aria-describedby="url-help"
               disabled={isDownloading}
               required
             />
             <p id="url-help" className="help-text">
-              Paste a YouTube video or playlist link.
+              {isPodcast
+                ? "Paste a public RSS feed. Episodes are saved in a folder named for the podcast."
+                : "Paste a YouTube video or playlist link."}
             </p>
           </div>
 
@@ -297,6 +385,20 @@ function App() {
                 <small>Every available video</small>
               </span>
             </label>
+            <label>
+              <input
+                type="radio"
+                name="download-type"
+                value="podcast"
+                checked={downloadType === "podcast"}
+                onChange={() => setDownloadType("podcast")}
+                disabled={isDownloading}
+              />
+              <span>
+                <strong>Podcast RSS feed</strong>
+                <small>Every available episode</small>
+              </span>
+            </label>
           </fieldset>
 
           <div className="field">
@@ -323,7 +425,7 @@ function App() {
           </div>
 
           <button className="download-button" type="submit" disabled={downloadUnavailable}>
-            {isDownloading ? "Downloading…" : "Download MP3"}
+            {isDownloading ? "Downloading…" : isPodcast ? "Download podcast" : "Download MP3"}
           </button>
         </form>
 
