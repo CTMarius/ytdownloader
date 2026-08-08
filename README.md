@@ -7,7 +7,6 @@ This is a Tauri-based desktop application for downloading audio from YouTube. It
 - Download individual YouTube videos or entire playlists as audio files
 - Save audio files in MP3 format with high quality (320K)
 - Select and save a custom download path
-- Automatically installs `yt-dlp` if it is not already installed
 - Cross-platform support (Windows, macOS, Linux)
 
 ## Prerequisites
@@ -17,6 +16,7 @@ Before setting up the project, ensure you have the following installed:
 - [Node.js](https://nodejs.org/) (version 16 or higher)
 - [Rust](https://www.rust-lang.org/tools/install) (with `cargo` package manager)
 - [Tauri prerequisites](https://tauri.app/v1/guides/getting-started/prerequisites) (varies by operating system)
+- [`yt-dlp`](https://github.com/yt-dlp/yt-dlp#installation), available on your system `PATH`
 
 ## Setup
 
@@ -93,7 +93,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## Support
 
 If you encounter any issues or have questions, please file an issue on the GitHub repository.
-
 
 
 
