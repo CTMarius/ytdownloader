@@ -53,7 +53,8 @@ function App() {
   const [url, setUrl] = useState("");
   const [downloadPath, setDownloadPath] = useState("");
   const [downloadType, setDownloadType] = useState<DownloadType>("single");
-  const [isInitializing, setIsInitializing] = useState(true);
+  const [isCheckingInstallation, setIsCheckingInstallation] = useState(true);
+  const [isLoadingPath, setIsLoadingPath] = useState(true);
   const [isSelectingPath, setIsSelectingPath] = useState(false);
   const [isDownloading, setIsDownloading] = useState(false);
   const [toolStatus, setToolStatus] = useState<Notice>({
@@ -69,37 +70,34 @@ function App() {
     let cancelled = false;
 
     const initialise = async () => {
-      try {
-        const installation = await invoke<InstallationStatus>("check_installation");
-        if (!cancelled) {
-          setToolStatus({
-            message: `yt-dlp ${installation.version} is ready.`,
-            tone: "success",
-          });
-        }
-      } catch (error) {
-        if (!cancelled) {
-          setToolStatus({ message: errorMessage(error), tone: "error" });
-        }
+      const [installationResult, pathResult] = await Promise.allSettled([
+        invoke<InstallationStatus>("check_installation"),
+        invoke<string>("get_download_path"),
+      ]);
+
+      if (cancelled) {
+        return;
       }
 
-      try {
-        const savedPath = await invoke<string>("get_download_path");
-        if (!cancelled) {
-          setDownloadPath(savedPath);
-        }
-      } catch (error) {
-        if (!cancelled) {
-          setNotice({
-            message: `Could not load the saved destination: ${errorMessage(error)}`,
-            tone: "error",
-          });
-        }
-      } finally {
-        if (!cancelled) {
-          setIsInitializing(false);
-        }
+      if (installationResult.status === "fulfilled") {
+        setToolStatus({
+          message: `yt-dlp ${installationResult.value.version} is ready.`,
+          tone: "success",
+        });
+      } else {
+        setToolStatus({ message: errorMessage(installationResult.reason), tone: "error" });
       }
+      setIsCheckingInstallation(false);
+
+      if (pathResult.status === "fulfilled") {
+        setDownloadPath(pathResult.value);
+      } else {
+        setNotice({
+          message: `Could not load the saved destination: ${errorMessage(pathResult.reason)}`,
+          tone: "error",
+        });
+      }
+      setIsLoadingPath(false);
     };
 
     void initialise();
@@ -108,6 +106,23 @@ function App() {
       cancelled = true;
     };
   }, []);
+
+  const handleCheckInstallation = async () => {
+    setIsCheckingInstallation(true);
+    setToolStatus({ message: "Checking yt-dlp…", tone: "neutral" });
+
+    try {
+      const installation = await invoke<InstallationStatus>("check_installation");
+      setToolStatus({
+        message: `yt-dlp ${installation.version} is ready.`,
+        tone: "success",
+      });
+    } catch (error) {
+      setToolStatus({ message: errorMessage(error), tone: "error" });
+    } finally {
+      setIsCheckingInstallation(false);
+    }
+  };
 
   const handleSelectPath = async () => {
     setIsSelectingPath(true);
@@ -195,23 +210,43 @@ function App() {
     }
   };
 
+  const isInitializing = isCheckingInstallation || isLoadingPath;
   const downloadUnavailable =
-    isInitializing || isSelectingPath || isDownloading || toolStatus.tone === "error";
+    isInitializing || isSelectingPath || isDownloading || toolStatus.tone !== "success";
 
   return (
     <main className="app-shell">
       <section className="download-card" aria-labelledby="app-title">
         <header className="card-header">
-          <p className="eyebrow">Audio downloader</p>
-          <h1 id="app-title">YouTube to MP3</h1>
+          <div className="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" focusable="false">
+              <path d="M9.5 8.5 16 12l-6.5 3.5v-7Z" />
+              <path d="M3.5 12c0-3.6.4-5.8 1.5-6.9C6.1 4 8.4 3.5 12 3.5s5.9.5 7 1.6c1.1 1.1 1.5 3.3 1.5 6.9s-.4 5.8-1.5 6.9c-1.1 1.1-3.4 1.6-7 1.6s-5.9-.5-7-1.6C3.9 17.8 3.5 15.6 3.5 12Z" />
+            </svg>
+          </div>
+          <div>
+            <p className="eyebrow">Audio downloader</p>
+            <h1 id="app-title">YouTube to MP3</h1>
+          </div>
           <p className="intro">Save a video or playlist as high-quality MP3 files.</p>
         </header>
 
-        <p className={`tool-status ${toolStatus.tone}`} role="status" aria-live="polite">
-          {toolStatus.message}
-        </p>
+        <div className={`tool-status ${toolStatus.tone}`} aria-live="polite">
+          <span className="status-indicator" aria-hidden="true" />
+          <span>{toolStatus.message}</span>
+          {toolStatus.tone === "error" && (
+            <button
+              type="button"
+              className="text-button"
+              onClick={handleCheckInstallation}
+              disabled={isCheckingInstallation || isDownloading}
+            >
+              Try again
+            </button>
+          )}
+        </div>
 
-        <form onSubmit={handleDownload}>
+        <form noValidate onSubmit={handleDownload}>
           <div className="field">
             <label htmlFor="youtube-url">YouTube URL</label>
             <input
@@ -243,7 +278,10 @@ function App() {
                 onChange={() => setDownloadType("single")}
                 disabled={isDownloading}
               />
-              Single video
+              <span>
+                <strong>Single video</strong>
+                <small>One MP3 file</small>
+              </span>
             </label>
             <label>
               <input
@@ -254,7 +292,10 @@ function App() {
                 onChange={() => setDownloadType("playlist")}
                 disabled={isDownloading}
               />
-              Entire playlist
+              <span>
+                <strong>Playlist</strong>
+                <small>Every available video</small>
+              </span>
             </label>
           </fieldset>
 
@@ -263,7 +304,11 @@ function App() {
               Download destination
             </span>
             <div className="destination-row">
-              <output className="destination-path" aria-labelledby="destination-label">
+              <output
+                className="destination-path"
+                aria-labelledby="destination-label"
+                title={downloadPath || undefined}
+              >
                 {downloadPath || "No folder selected"}
               </output>
               <button

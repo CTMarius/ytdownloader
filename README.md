@@ -40,10 +40,12 @@ Before setting up the project, ensure you have the following installed:
 
 Run the app in development mode:
 ```sh
-npm run dev
+npm run tauri dev
 ```
 
-This will start both the Vite development server and the Tauri backend. The app will be available at `http://localhost:1420`.
+This starts the Vite development server and opens the Tauri desktop application. Use
+`npm run dev` only when you need the frontend development server at
+`http://localhost:1420`.
 
 ## Building for Production
 
@@ -93,7 +95,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## Support
 
 If you encounter any issues or have questions, please file an issue on the GitHub repository.
-
 
 
 
