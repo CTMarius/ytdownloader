@@ -1,22 +1,30 @@
+use reqwest::{blocking::Client, redirect::Policy};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::hash_map::DefaultHasher,
     fs,
     hash::{Hash, Hasher},
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::{Child, Command, Output, Stdio},
+    process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tauri::{command, AppHandle, Emitter, State};
+use tauri::{command, AppHandle, Emitter, Manager, State};
 use url::Url;
 
 const SETTINGS_FILE: &str = ".yt-dlp-tauri-settings";
+const RUNTIME_DIRECTORY: &str = "runtime-tools-v1";
+const RUNTIME_MANIFEST_FILE: &str = "runtime-manifest.json";
+const RUNTIME_SCHEMA_VERSION: u8 = 1;
+const YT_DLP_VERSION: &str = "2026.07.04";
+const FFMPEG_RELEASE: &str = "b6.1.1";
+const MAX_RUNTIME_ASSET_BYTES: u64 = 500 * 1024 * 1024;
 
 #[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -26,8 +34,43 @@ enum DownloadType {
 }
 
 #[derive(Serialize)]
-struct InstallationStatus {
-    version: String,
+#[serde(rename_all = "camelCase")]
+struct RuntimeSetupStatus {
+    ready: bool,
+    message: String,
+    yt_dlp_version: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeSetupProgress {
+    current: usize,
+    total: usize,
+    component: String,
+    message: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeManifest {
+    schema_version: u8,
+    platform: String,
+    yt_dlp_version: String,
+    ffmpeg_release: String,
+}
+
+struct RuntimeAsset {
+    component: &'static str,
+    file_name: &'static str,
+    url: &'static str,
+    sha256: &'static str,
+}
+
+struct RuntimeTools {
+    directory: PathBuf,
+    yt_dlp: PathBuf,
+    ffmpeg: PathBuf,
+    ffprobe: PathBuf,
 }
 
 /// The outcome of a download command. `status` lets the UI distinguish a
@@ -65,32 +108,576 @@ struct DownloadManager {
     pause_requested: Arc<AtomicBool>,
 }
 
-#[command]
-fn check_installation() -> Result<InstallationStatus, String> {
-    let output = Command::new("yt-dlp")
-        .arg("--version")
-        .output()
-        .map_err(|error| match error.kind() {
-            std::io::ErrorKind::NotFound => {
-                "yt-dlp was not found. Install yt-dlp and ensure it is available on your PATH."
-                    .to_string()
-            }
-            _ => format!("Could not run yt-dlp: {error}"),
-        })?;
+#[derive(Clone, Default)]
+struct RuntimeSetupManager {
+    install_lock: Arc<Mutex<()>>,
+}
 
+#[command]
+async fn get_runtime_setup_status(app: AppHandle) -> Result<RuntimeSetupStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || runtime_setup_status(&app))
+        .await
+        .map_err(|error| format!("Could not check the app runtime: {error}"))?
+}
+
+#[command]
+async fn setup_runtime_dependencies(
+    app: AppHandle,
+    state: State<'_, RuntimeSetupManager>,
+) -> Result<RuntimeSetupStatus, String> {
+    let setup_manager = state.inner().clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let _install_guard = setup_manager
+            .install_lock
+            .lock()
+            .map_err(|_| "Runtime setup could not acquire its installation lock.".to_string())?;
+        install_runtime_dependencies(&app)?;
+
+        let status = runtime_setup_status(&app)?;
+        if status.ready {
+            Ok(status)
+        } else {
+            Err("Runtime setup finished, but the installed tools could not be verified. Retry setup."
+                .to_string())
+        }
+    })
+    .await
+    .map_err(|error| format!("Runtime setup ended unexpectedly: {error}"))?
+}
+
+fn runtime_setup_status(app: &AppHandle) -> Result<RuntimeSetupStatus, String> {
+    let assets = runtime_assets()?;
+    let directory = runtime_tools_directory(app)?;
+
+    if !runtime_manifest_is_current(&directory) {
+        return Ok(runtime_needs_setup_status());
+    }
+
+    let tools = runtime_tools_in_directory(directory, &assets);
+    if !runtime_tools_are_regular_files(&tools) {
+        return Ok(runtime_needs_setup_status());
+    }
+
+    match verify_runtime_tools(&tools) {
+        Ok(yt_dlp_version) => Ok(RuntimeSetupStatus {
+            ready: true,
+            message: "Private yt-dlp, ffmpeg, and ffprobe tools are ready.".to_string(),
+            yt_dlp_version: Some(yt_dlp_version),
+        }),
+        Err(_) => Ok(runtime_needs_setup_status()),
+    }
+}
+
+fn runtime_needs_setup_status() -> RuntimeSetupStatus {
+    RuntimeSetupStatus {
+        ready: false,
+        message: "The app needs to download its private yt-dlp, ffmpeg, and ffprobe tools."
+            .to_string(),
+        yt_dlp_version: None,
+    }
+}
+
+fn runtime_assets() -> Result<Vec<RuntimeAsset>, String> {
+    runtime_assets_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn runtime_assets_for(os: &str, arch: &str) -> Result<Vec<RuntimeAsset>, String> {
+    let yt_dlp = |file_name, url, sha256| RuntimeAsset {
+        component: "yt-dlp",
+        file_name,
+        url,
+        sha256,
+    };
+    let ffmpeg = |file_name, url, sha256| RuntimeAsset {
+        component: "ffmpeg",
+        file_name,
+        url,
+        sha256,
+    };
+    let ffprobe = |file_name, url, sha256| RuntimeAsset {
+        component: "ffprobe",
+        file_name,
+        url,
+        sha256,
+    };
+
+    match (os, arch) {
+        ("windows", "x86_64") => Ok(vec![
+            yt_dlp(
+                "yt-dlp.exe",
+                "https://github.com/yt-dlp/yt-dlp/releases/download/2026.07.04/yt-dlp.exe",
+                "52fe3c26dcf71fbdc85b528589020bb0b8e383155cfa81b64dd447bbe35e24b8",
+            ),
+            ffmpeg(
+                "ffmpeg.exe",
+                "https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffmpeg-win32-x64",
+                "04e1307997530f9cf2fe35cba2ca7e8875ca91da02f89d6c7243df819c94ad00",
+            ),
+            ffprobe(
+                "ffprobe.exe",
+                "https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffprobe-win32-x64",
+                "3a7e2dc003dc2cd1472827e4c7c4f056ae1ae0ae7c5bbc580c99b49827351ba4",
+            ),
+        ]),
+        ("linux", "x86_64") => Ok(vec![
+            yt_dlp(
+                "yt-dlp",
+                "https://github.com/yt-dlp/yt-dlp/releases/download/2026.07.04/yt-dlp_linux",
+                "6bbb3d314cde4febe36e5fa1d55462e29c974f63444e707871834f6d8cc210ae",
+            ),
+            ffmpeg(
+                "ffmpeg",
+                "https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffmpeg-linux-x64",
+                "e7e7fb30477f717e6f55f9180a70386c62677ef8a4d4d1a5d948f4098aa3eb99",
+            ),
+            ffprobe(
+                "ffprobe",
+                "https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffprobe-linux-x64",
+                "4f231a1960d83e403d08f7971e271707bec278a9ae18e21b8b5b03186668450d",
+            ),
+        ]),
+        ("linux", "aarch64") => Ok(vec![
+            yt_dlp(
+                "yt-dlp",
+                "https://github.com/yt-dlp/yt-dlp/releases/download/2026.07.04/yt-dlp_linux_aarch64",
+                "b6ce97646773070d7a7ffd6bbbdcaecb47c48483909c54c915bf08a7a9b5e0b1",
+            ),
+            ffmpeg(
+                "ffmpeg",
+                "https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffmpeg-linux-arm64",
+                "6bb182d0d75d23028db82e9e4f723ca69b853d055698486e6984ddb2c06fb8ce",
+            ),
+            ffprobe(
+                "ffprobe",
+                "https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffprobe-linux-arm64",
+                "d17ae9b4c297d48e2521ba14e417bb0537c6ff77c584cdbcd6bb0d8d0307a2e8",
+            ),
+        ]),
+        ("macos", "x86_64") => Ok(vec![
+            yt_dlp(
+                "yt-dlp",
+                "https://github.com/yt-dlp/yt-dlp/releases/download/2026.07.04/yt-dlp_macos",
+                "498bd0dae17855c599d371d68ec5bafc439a9d8640e838be25c765a9792f261b",
+            ),
+            ffmpeg(
+                "ffmpeg",
+                "https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffmpeg-darwin-x64",
+                "ebdddc936f61e14049a2d4b549a412b8a40deeff6540e58a9f2a2da9e6b18894",
+            ),
+            ffprobe(
+                "ffprobe",
+                "https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffprobe-darwin-x64",
+                "fa3add0ce901f7241abe0dfc0155d958fc834aca3f8ce61f87cc712ae669c1e0",
+            ),
+        ]),
+        ("macos", "aarch64") => Ok(vec![
+            yt_dlp(
+                "yt-dlp",
+                "https://github.com/yt-dlp/yt-dlp/releases/download/2026.07.04/yt-dlp_macos",
+                "498bd0dae17855c599d371d68ec5bafc439a9d8640e838be25c765a9792f261b",
+            ),
+            ffmpeg(
+                "ffmpeg",
+                "https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffmpeg-darwin-arm64",
+                "a90e3db6a3fd35f6074b013f948b1aa45b31c6375489d39e572bea3f18336584",
+            ),
+            ffprobe(
+                "ffprobe",
+                "https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffprobe-darwin-arm64",
+                "bb2db6f5d8cef919da12fbf592119a987202a8c060a886f3cab091f9cab90b64",
+            ),
+        ]),
+        _ => Err(format!(
+            "Runtime setup is not supported on {os} ({arch}). Supported platforms are Windows x64, Linux x64 or ARM64, and macOS Intel or Apple silicon."
+        )),
+    }
+}
+
+fn runtime_tools_directory(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|directory| directory.join(RUNTIME_DIRECTORY))
+        .map_err(|error| {
+            format!("Could not determine the app data directory for runtime setup: {error}")
+        })
+}
+
+fn runtime_tools_in_directory(directory: PathBuf, assets: &[RuntimeAsset]) -> RuntimeTools {
+    RuntimeTools {
+        directory: directory.clone(),
+        yt_dlp: directory.join(assets[0].file_name),
+        ffmpeg: directory.join(assets[1].file_name),
+        ffprobe: directory.join(assets[2].file_name),
+    }
+}
+
+fn resolve_runtime_tools(app: &AppHandle) -> Result<RuntimeTools, String> {
+    let assets = runtime_assets()?;
+    let directory = runtime_tools_directory(app)?;
+    if !runtime_manifest_is_current(&directory) {
+        return Err(
+            "The app's private runtime tools are unavailable. Restart the app and complete setup."
+                .to_string(),
+        );
+    }
+
+    let tools = runtime_tools_in_directory(directory, &assets);
+    if !runtime_tools_are_regular_files(&tools) {
+        return Err(
+            "The app's private runtime tools are unavailable. Restart the app and complete setup."
+                .to_string(),
+        );
+    }
+
+    Ok(tools)
+}
+
+fn runtime_tools_are_regular_files(tools: &RuntimeTools) -> bool {
+    [&tools.yt_dlp, &tools.ffmpeg, &tools.ffprobe]
+        .iter()
+        .all(|path| {
+            fs::symlink_metadata(path)
+                .map(|metadata| {
+                    metadata.file_type().is_file() && !metadata.file_type().is_symlink()
+                })
+                .unwrap_or(false)
+        })
+}
+
+fn runtime_manifest_is_current(directory: &Path) -> bool {
+    let manifest_path = directory.join(RUNTIME_MANIFEST_FILE);
+    let Ok(metadata) = fs::symlink_metadata(&manifest_path) else {
+        return false;
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return false;
+    }
+
+    let Some(manifest) = fs::read(&manifest_path)
+        .ok()
+        .and_then(|contents| serde_json::from_slice::<RuntimeManifest>(&contents).ok())
+    else {
+        return false;
+    };
+
+    manifest.schema_version == RUNTIME_SCHEMA_VERSION
+        && manifest.platform == current_platform()
+        && manifest.yt_dlp_version == YT_DLP_VERSION
+        && manifest.ffmpeg_release == FFMPEG_RELEASE
+}
+
+fn current_platform() -> String {
+    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn verify_runtime_tools(tools: &RuntimeTools) -> Result<String, String> {
+    let yt_dlp_version = command_version(&tools.yt_dlp, "--version", "yt-dlp")?;
+    if yt_dlp_version != YT_DLP_VERSION {
+        return Err(
+            "The installed yt-dlp version does not match the expected runtime version.".to_string(),
+        );
+    }
+
+    command_version(&tools.ffmpeg, "-version", "ffmpeg")?;
+    command_version(&tools.ffprobe, "-version", "ffprobe")?;
+
+    Ok(yt_dlp_version)
+}
+
+fn command_version(path: &Path, argument: &str, component: &str) -> Result<String, String> {
+    let output = Command::new(path)
+        .arg(argument)
+        .output()
+        .map_err(|_| format!("Could not run the private {component} tool."))?;
     if !output.status.success() {
         return Err(format!(
-            "yt-dlp could not start successfully: {}",
-            command_output_message(&output)
+            "The private {component} tool did not start successfully."
         ));
     }
 
-    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let version = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     if version.is_empty() {
-        return Err("yt-dlp did not return a version number.".to_string());
+        return Err(format!(
+            "The private {component} tool did not return version information."
+        ));
     }
 
-    Ok(InstallationStatus { version })
+    Ok(version)
+}
+
+fn install_runtime_dependencies(app: &AppHandle) -> Result<(), String> {
+    let assets = runtime_assets()?;
+    let tools_directory = runtime_tools_directory(app)?;
+    let app_data_directory = tools_directory
+        .parent()
+        .ok_or_else(|| "Could not prepare the app data directory for runtime setup.".to_string())?;
+    ensure_private_runtime_parent(app_data_directory)?;
+
+    let staging_directory = create_staging_directory(app_data_directory)?;
+    let setup_result = (|| {
+        let client = Client::builder()
+            .https_only(true)
+            .connect_timeout(Duration::from_secs(20))
+            .timeout(Duration::from_secs(15 * 60))
+            .redirect(Policy::custom(|attempt| {
+                if attempt.previous().len() < 5 && attempt.url().scheme() == "https" {
+                    attempt.follow()
+                } else {
+                    attempt.stop()
+                }
+            }))
+            .user_agent("YTDownloader runtime setup")
+            .build()
+            .map_err(|error| format!("Could not prepare a secure runtime download: {error}"))?;
+
+        for (index, asset) in assets.iter().enumerate() {
+            app.emit(
+                "runtime-setup-progress",
+                RuntimeSetupProgress {
+                    current: index + 1,
+                    total: assets.len(),
+                    component: asset.component.to_string(),
+                    message: format!("Downloading {}…", asset.component),
+                },
+            )
+            .map_err(|error| format!("Could not report runtime setup progress: {error}"))?;
+
+            let destination = staging_directory.join(asset.file_name);
+            download_runtime_asset(&client, asset, &destination)?;
+            set_runtime_executable_permissions(&destination)?;
+        }
+
+        write_runtime_manifest(&staging_directory)?;
+        let staged_tools = runtime_tools_in_directory(staging_directory.clone(), &assets);
+        verify_runtime_tools(&staged_tools)?;
+        replace_runtime_installation(&staging_directory, &tools_directory)
+    })();
+
+    if setup_result.is_err() && staging_directory.exists() {
+        let _ = fs::remove_dir_all(&staging_directory);
+    }
+
+    setup_result
+}
+
+fn ensure_private_runtime_parent(path: &Path) -> Result<(), String> {
+    fs::create_dir_all(path).map_err(|error| {
+        format!("Could not create the app data directory for runtime setup: {error}")
+    })?;
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        format!("Could not access the app data directory for runtime setup: {error}")
+    })?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err("The app data location for runtime setup is not a directory.".to_string());
+    }
+    set_private_directory_permissions(path)
+}
+
+fn create_staging_directory(parent: &Path) -> Result<PathBuf, String> {
+    for attempt in 0..10 {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let path = parent.join(format!(
+            ".{RUNTIME_DIRECTORY}-staging-{}-{timestamp}-{attempt}",
+            std::process::id()
+        ));
+        match fs::create_dir(&path) {
+            Ok(()) => {
+                set_private_directory_permissions(&path)?;
+                return Ok(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "Could not create a temporary directory for runtime setup: {error}"
+                ));
+            }
+        }
+    }
+
+    Err("Could not create a unique temporary directory for runtime setup.".to_string())
+}
+
+fn download_runtime_asset(
+    client: &Client,
+    asset: &RuntimeAsset,
+    destination: &Path,
+) -> Result<(), String> {
+    let download_result = (|| {
+        let mut response = client
+            .get(asset.url)
+            .send()
+            .map_err(|error| format!("Could not download {}: {error}", asset.component))?
+            .error_for_status()
+            .map_err(|error| format!("Could not download {} securely: {error}", asset.component))?;
+
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_RUNTIME_ASSET_BYTES)
+        {
+            return Err(format!(
+                "The {} download is unexpectedly large and was rejected.",
+                asset.component
+            ));
+        }
+
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)
+            .map_err(|error| format!("Could not save {} for setup: {error}", asset.component))?;
+        let mut hasher = Sha256::new();
+        let mut total_bytes = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+
+        loop {
+            let bytes_read = response
+                .read(&mut buffer)
+                .map_err(|error| format!("Could not download {}: {error}", asset.component))?;
+            if bytes_read == 0 {
+                break;
+            }
+
+            total_bytes = total_bytes.saturating_add(bytes_read as u64);
+            if total_bytes > MAX_RUNTIME_ASSET_BYTES {
+                return Err(format!(
+                    "The {} download is unexpectedly large and was rejected.",
+                    asset.component
+                ));
+            }
+
+            file.write_all(&buffer[..bytes_read]).map_err(|error| {
+                format!("Could not save {} for setup: {error}", asset.component)
+            })?;
+            hasher.update(&buffer[..bytes_read]);
+        }
+
+        file.sync_all().map_err(|error| {
+            format!(
+                "Could not finish saving {} for setup: {error}",
+                asset.component
+            )
+        })?;
+
+        let actual_sha256 = format!("{:x}", hasher.finalize());
+        if !actual_sha256.eq_ignore_ascii_case(asset.sha256) {
+            return Err(format!(
+                "The {} download failed its security check. Retry setup.",
+                asset.component
+            ));
+        }
+
+        Ok(())
+    })();
+
+    if download_result.is_err() {
+        let _ = fs::remove_file(destination);
+    }
+    download_result
+}
+
+fn write_runtime_manifest(directory: &Path) -> Result<(), String> {
+    let manifest = RuntimeManifest {
+        schema_version: RUNTIME_SCHEMA_VERSION,
+        platform: current_platform(),
+        yt_dlp_version: YT_DLP_VERSION.to_string(),
+        ffmpeg_release: FFMPEG_RELEASE.to_string(),
+    };
+    let contents = serde_json::to_vec(&manifest)
+        .map_err(|error| format!("Could not prepare runtime setup metadata: {error}"))?;
+    let path = directory.join(RUNTIME_MANIFEST_FILE);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| format!("Could not save runtime setup metadata: {error}"))?;
+    file.write_all(&contents)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("Could not save runtime setup metadata: {error}"))
+}
+
+fn replace_runtime_installation(
+    staging_directory: &Path,
+    tools_directory: &Path,
+) -> Result<(), String> {
+    let backup_directory = tools_directory.with_file_name(format!(
+        ".{RUNTIME_DIRECTORY}-backup-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default()
+    ));
+
+    let existing_tools = match fs::symlink_metadata(tools_directory) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+                return Err("The existing private runtime location is not a directory.".to_string());
+            }
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(format!(
+                "Could not inspect the existing private runtime location: {error}"
+            ));
+        }
+    };
+
+    if existing_tools {
+        fs::rename(tools_directory, &backup_directory)
+            .map_err(|error| format!("Could not update the private runtime tools: {error}"))?;
+    }
+
+    if let Err(error) = fs::rename(staging_directory, tools_directory) {
+        if existing_tools {
+            let _ = fs::rename(&backup_directory, tools_directory);
+        }
+        return Err(format!(
+            "Could not install the private runtime tools: {error}"
+        ));
+    }
+
+    if existing_tools {
+        // The new, verified runtime is already active, so a leftover backup must not block the app.
+        let _ = fs::remove_dir_all(&backup_directory);
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_directory_permissions(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("Could not secure the app runtime directory: {error}"))
+}
+
+#[cfg(not(unix))]
+fn set_private_directory_permissions(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_runtime_executable_permissions(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("Could not mark a private runtime tool as executable: {error}"))
+}
+
+#[cfg(not(unix))]
+fn set_runtime_executable_permissions(_path: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 #[command]
@@ -143,13 +730,14 @@ async fn download_audio(
 ) -> Result<DownloadResult, String> {
     let url = validate_youtube_url(&url)?;
     let download_path = validate_download_directory(&path)?;
+    let tools = resolve_runtime_tools(&app)?;
     let kind = match download_type {
         DownloadType::Single => "single",
         DownloadType::Playlist => "playlist",
     };
     let archive_path = archive_path_for(kind, &url)?;
 
-    let mut command = Command::new("yt-dlp");
+    let mut command = yt_dlp_command(&tools);
     command
         .arg("--extract-audio")
         .arg("--audio-format")
@@ -200,12 +788,13 @@ async fn download_podcast(
 ) -> Result<DownloadResult, String> {
     let url = validate_podcast_feed_url(&url)?;
     let download_path = validate_download_directory(&path)?;
-    let metadata = read_podcast_metadata(&url)?;
+    let tools = resolve_runtime_tools(&app)?;
+    let metadata = read_podcast_metadata(&tools, &url)?;
     let folder_name = sanitize_podcast_folder_title(metadata.title.as_deref().unwrap_or_default());
     let podcast_path = create_podcast_directory(&download_path, &folder_name)?;
     let archive_path = archive_path_for("podcast", &url)?;
 
-    let mut command = Command::new("yt-dlp");
+    let mut command = yt_dlp_command(&tools);
     command
         .arg("--extract-audio")
         .arg("--audio-format")
@@ -231,7 +820,15 @@ async fn download_podcast(
         "Finished downloading all available podcast episodes to the “{folder_name}” folder."
     );
 
-    run_monitored_download(&state, &app, "podcast", archive_path, command, success_message).await
+    run_monitored_download(
+        &state,
+        &app,
+        "podcast",
+        archive_path,
+        command,
+        success_message,
+    )
+    .await
 }
 
 /// Requests that the active download stop or pause. Both simply terminate the
@@ -280,6 +877,12 @@ fn pause_download(state: State<'_, DownloadManager>) -> Result<DownloadResult, S
     request_download_interruption(&state, false)
 }
 
+fn yt_dlp_command(tools: &RuntimeTools) -> Command {
+    let mut command = Command::new(&tools.yt_dlp);
+    command.arg("--ffmpeg-location").arg(&tools.directory);
+    command
+}
+
 /// Runs `yt-dlp` on a dedicated blocking thread (so the UI never freezes),
 /// streams progress events to the frontend, and tracks the child process in
 /// `DownloadManager` so `stop_download`/`pause_download` can interrupt it.
@@ -306,9 +909,10 @@ async fn run_monitored_download(
             .spawn()
             .map_err(|error| match error.kind() {
                 std::io::ErrorKind::NotFound => {
-                    "yt-dlp was not found. Install yt-dlp and restart the application.".to_string()
+                    "The app's private yt-dlp tool is unavailable. Restart the app and complete setup."
+                        .to_string()
                 }
-                _ => format!("Could not start yt-dlp: {error}"),
+                _ => format!("Could not start the app's private yt-dlp tool: {error}"),
             })?;
 
         let stdout = child
@@ -517,8 +1121,11 @@ fn validate_podcast_feed_url(value: &str) -> Result<Url, String> {
     Ok(url)
 }
 
-fn read_podcast_metadata(url: &Url) -> Result<PodcastPlaylistMetadata, String> {
-    let output = Command::new("yt-dlp")
+fn read_podcast_metadata(
+    tools: &RuntimeTools,
+    url: &Url,
+) -> Result<PodcastPlaylistMetadata, String> {
+    let output = yt_dlp_command(tools)
         .arg("--simulate")
         .arg("--flat-playlist")
         .arg("--playlist-end")
@@ -531,9 +1138,12 @@ fn read_podcast_metadata(url: &Url) -> Result<PodcastPlaylistMetadata, String> {
         .output()
         .map_err(|error| match error.kind() {
             std::io::ErrorKind::NotFound => {
-                "yt-dlp was not found. Install yt-dlp and restart the application.".to_string()
+                "The app's private yt-dlp tool is unavailable. Restart the app and complete setup."
+                    .to_string()
             }
-            _ => format!("Could not start yt-dlp to inspect the podcast feed: {error}"),
+            _ => format!(
+                "Could not start the app's private yt-dlp tool to inspect the podcast feed: {error}"
+            ),
         })?;
 
     if !output.status.success() {
@@ -632,22 +1242,6 @@ fn parse_download_progress(line: &str) -> Option<(usize, usize, String)> {
     Some((current, total, percent.trim().chars().take(12).collect()))
 }
 
-fn command_output_message(output: &Output) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let message = if stderr.trim().is_empty() {
-        stdout.trim()
-    } else {
-        stderr.trim()
-    };
-
-    if message.is_empty() {
-        format!("process exited with status {}", output.status)
-    } else {
-        message.chars().take(1_000).collect()
-    }
-}
-
 fn path_to_string(path: &Path) -> Result<String, String> {
     path.to_str()
         .map(str::to_owned)
@@ -658,8 +1252,10 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(DownloadManager::default())
+        .manage(RuntimeSetupManager::default())
         .invoke_handler(tauri::generate_handler![
-            check_installation,
+            get_runtime_setup_status,
+            setup_runtime_dependencies,
             save_download_path,
             get_download_path,
             download_audio,
@@ -674,8 +1270,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_download_progress, sanitize_podcast_folder_title, validate_podcast_feed_url,
-        validate_youtube_url,
+        parse_download_progress, runtime_assets_for, sanitize_podcast_folder_title,
+        validate_podcast_feed_url, validate_youtube_url,
     };
 
     #[test]
@@ -715,5 +1311,37 @@ mod tests {
         assert_eq!(total, 2857);
         assert_eq!(percent, "42.5%");
         assert!(parse_download_progress("unrelated output").is_none());
+    }
+
+    #[test]
+    fn pins_and_checksums_runtime_assets_for_supported_platforms() {
+        for (os, arch) in [
+            ("windows", "x86_64"),
+            ("linux", "x86_64"),
+            ("linux", "aarch64"),
+            ("macos", "x86_64"),
+            ("macos", "aarch64"),
+        ] {
+            let assets = runtime_assets_for(os, arch).unwrap();
+            assert_eq!(assets.len(), 3);
+            assert_eq!(assets[0].component, "yt-dlp");
+            assert_eq!(assets[1].component, "ffmpeg");
+            assert_eq!(assets[2].component, "ffprobe");
+            assert!(assets.iter().all(|asset| asset.url.starts_with("https://")));
+            assert!(assets.iter().all(|asset| {
+                asset.sha256.len() == 64
+                    && asset
+                        .sha256
+                        .chars()
+                        .all(|character| character.is_ascii_hexdigit())
+            }));
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_runtime_platforms() {
+        assert!(runtime_assets_for("windows", "aarch64").is_err());
+        assert!(runtime_assets_for("linux", "arm").is_err());
+        assert!(runtime_assets_for("freebsd", "x86_64").is_err());
     }
 }

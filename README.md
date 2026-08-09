@@ -11,6 +11,31 @@ This is a Tauri-based desktop application for downloading audio from YouTube and
 - Live progress bar with item counts for playlist and podcast downloads
 - Pause and resume long downloads, or stop them outright, without freezing the UI
 - Cross-platform support (Windows, macOS, Linux)
+- First-run runtime setup for private, verified copies of `yt-dlp`, `ffmpeg`, and `ffprobe`
+
+## First-run runtime setup
+
+On first launch, the app blocks downloads while it downloads the audio tools it needs. The tools
+are stored only in this application's per-user app-data directory; YTDownloader never modifies
+the system or user `PATH`, and every tool invocation uses those private copies explicitly.
+
+Setup requires an internet connection and shows the current component as it downloads. Downloads
+are HTTPS-only, version-pinned, and SHA-256 checked before installation. If a download, checksum,
+or local validation fails, setup remains on the error screen and can be retried safely.
+
+The current runtime supports:
+
+- Windows x64
+- Linux x64 and ARM64
+- macOS Intel and Apple silicon
+
+Other platform/architecture combinations show an unsupported-platform error instead of falling
+back to a tool found on `PATH`.
+
+The pinned artifacts are `yt-dlp` `2026.07.04` from the
+[yt-dlp releases](https://github.com/yt-dlp/yt-dlp/releases) and `ffmpeg`/`ffprobe` `b6.1.1`
+from [ffmpeg-static releases](https://github.com/eugeneware/ffmpeg-static/releases). Their
+expected SHA-256 digests are part of the native application and are verified during setup.
 
 ## Downloading a podcast RSS feed
 
@@ -36,7 +61,6 @@ Before setting up the project, ensure you have the following installed:
 - [Node.js](https://nodejs.org/) (version 16 or higher)
 - [Rust](https://www.rust-lang.org/tools/install) (with `cargo` package manager)
 - [Tauri prerequisites](https://tauri.app/v1/guides/getting-started/prerequisites) (varies by operating system)
-- [`yt-dlp`](https://github.com/yt-dlp/yt-dlp#installation), available on your system `PATH`
 
 ## Setup
 
@@ -115,7 +139,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## Support
 
 If you encounter any issues or have questions, please file an issue on the GitHub repository.
-
 
 
 

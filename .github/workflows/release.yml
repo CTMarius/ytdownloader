@@ -33,12 +33,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
-      - name: Install yt-dlp (Linux)
-        if: matrix.platform == 'ubuntu-22.04'
-        run: |
-          sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
-          sudo chmod a+rx /usr/local/bin/yt-dlp
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:

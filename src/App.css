@@ -44,13 +44,67 @@ button:disabled {
     linear-gradient(145deg, #f8faff, #eef3fb);
 }
 
-.download-card {
+.download-card,
+.setup-card {
   width: min(100%, 42rem);
   padding: clamp(1.25rem, 3.5vw, 2.25rem);
   border: 1px solid rgba(214, 224, 240, 0.9);
   border-radius: 1.25rem;
   background: rgba(255, 255, 255, 0.94);
   box-shadow: 0 1.25rem 3.75rem rgba(29, 47, 79, 0.12);
+}
+
+.setup-card {
+  display: grid;
+  gap: 1rem;
+  text-align: center;
+}
+
+.setup-card .brand-mark {
+  justify-self: center;
+}
+
+.setup-card .eyebrow {
+  margin: 0;
+}
+
+.setup-card h1 {
+  margin: -0.5rem 0 0;
+}
+
+.setup-intro {
+  max-width: 34rem;
+  margin: 0 auto;
+  color: #5d6b84;
+  font-size: 0.95rem;
+  line-height: 1.5;
+}
+
+.setup-progress,
+.setup-error {
+  display: grid;
+  gap: 0.65rem;
+  padding: 1rem;
+  border: 1px solid #d5deeb;
+  border-radius: 0.75rem;
+  color: #4b5b75;
+  text-align: left;
+  background: #f8fafd;
+}
+
+.setup-progress .help-text {
+  margin: 0;
+}
+
+.setup-error {
+  border-color: #f1cccc;
+  color: #a52929;
+  background: #fff4f4;
+}
+
+.setup-error strong,
+.setup-error span {
+  display: block;
 }
 
 .card-header {

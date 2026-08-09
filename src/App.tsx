@@ -7,8 +7,17 @@ import "./App.css";
 type DownloadType = "single" | "playlist" | "podcast";
 type NoticeTone = "neutral" | "success" | "error";
 
-interface InstallationStatus {
-  version: string;
+interface RuntimeSetupStatus {
+  ready: boolean;
+  message: string;
+  ytDlpVersion: string | null;
+}
+
+interface RuntimeSetupProgress {
+  current: number;
+  total: number;
+  component: "yt-dlp" | "ffmpeg" | "ffprobe";
+  message: string;
 }
 
 interface DownloadResult {
@@ -76,11 +85,86 @@ function errorMessage(error: unknown): string {
   return "An unexpected error occurred. Please try again.";
 }
 
+function SetupScreen({
+  phase,
+  progress,
+  error,
+  onRetry,
+}: {
+  phase: "checking" | "installing" | "error";
+  progress: RuntimeSetupProgress | null;
+  error: string | null;
+  onRetry: () => void;
+}) {
+  const isInstalling = phase === "installing";
+  const step = progress?.current ?? 0;
+  const total = progress?.total ?? 3;
+  const progressPercent = isInstalling ? Math.round((step / total) * 100) : 0;
+
+  return (
+    <main className="app-shell">
+      <section className="setup-card" aria-labelledby="setup-title">
+        <div className="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" focusable="false">
+            <path d="M9.5 8.5 16 12l-6.5 3.5v-7Z" />
+            <path d="M3.5 12c0-3.6.4-5.8 1.5-6.9C6.1 4 8.4 3.5 12 3.5s5.9.5 7 1.6c1.1 1.1 1.5 3.3 1.5 6.9s-.4 5.8-1.5 6.9c-1.1 1.1-3.4 1.6-7 1.6s-5.9-.5-7-1.6C3.9 17.8 3.5 15.6 3.5 12Z" />
+          </svg>
+        </div>
+        <p className="eyebrow">First-run setup</p>
+        <h1 id="setup-title">Preparing audio tools</h1>
+        <p className="setup-intro">
+          YTDownloader uses private copies of yt-dlp, ffmpeg, and ffprobe. They are stored in
+          this app’s data folder and do not change your system PATH.
+        </p>
+
+        {phase !== "error" && (
+          <div className="setup-progress" role="status" aria-live="polite">
+            <div className="progress-meta">
+              <span>
+                {isInstalling
+                  ? progress?.message ?? "Preparing secure downloads…"
+                  : "Checking installed audio tools…"}
+              </span>
+              {isInstalling && <strong>{step > 0 ? `${step} of ${total}` : ""}</strong>}
+            </div>
+            <div className="progress-bar-track">
+              <div className="progress-bar-fill" style={{ width: `${progressPercent}%` }} />
+            </div>
+            <p className="help-text">
+              {isInstalling
+                ? "Each download is version-pinned and verified before it can be used."
+                : "This only takes a moment when the tools are already installed."}
+            </p>
+          </div>
+        )}
+
+        {phase === "error" && (
+          <div className="setup-error" role="alert">
+            <strong>Setup could not finish.</strong>
+            <span>{error}</span>
+          </div>
+        )}
+
+        {phase === "error" && (
+          <button type="button" className="download-button" onClick={onRetry}>
+            Retry setup
+          </button>
+        )}
+      </section>
+    </main>
+  );
+}
+
 function App() {
   const [url, setUrl] = useState("");
   const [downloadPath, setDownloadPath] = useState("");
   const [downloadType, setDownloadType] = useState<DownloadType>("single");
-  const [isCheckingInstallation, setIsCheckingInstallation] = useState(true);
+  const [setupPhase, setSetupPhase] = useState<"checking" | "installing" | "ready" | "error">(
+    "checking",
+  );
+  const [setupAttempt, setSetupAttempt] = useState(0);
+  const [setupProgress, setSetupProgress] = useState<RuntimeSetupProgress | null>(null);
+  const [setupError, setSetupError] = useState<string | null>(null);
   const [isLoadingPath, setIsLoadingPath] = useState(true);
   const [isSelectingPath, setIsSelectingPath] = useState(false);
   const [isDownloading, setIsDownloading] = useState(false);
@@ -90,7 +174,7 @@ function App() {
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
   const [resumeParams, setResumeParams] = useState<StartedDownloadParams | null>(null);
   const [toolStatus, setToolStatus] = useState<Notice>({
-    message: "Checking yt-dlp…",
+    message: "Preparing private audio tools…",
     tone: "neutral",
   });
   const [notice, setNotice] = useState<Notice>({
@@ -99,40 +183,98 @@ function App() {
   });
 
   useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+
+    void listen<RuntimeSetupProgress>("runtime-setup-progress", (event) => {
+      setSetupProgress(event.payload);
+    }).then((stopListening) => {
+      if (disposed) {
+        stopListening();
+      } else {
+        unlisten = stopListening;
+      }
+    }).catch(() => {
+      // The setup command still reports completion or failure if progress events are unavailable.
+    });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
     let cancelled = false;
 
-    const initialise = async () => {
-      const [installationResult, pathResult] = await Promise.allSettled([
-        invoke<InstallationStatus>("check_installation"),
-        invoke<string>("get_download_path"),
-      ]);
+    const prepareRuntime = async () => {
+      setSetupPhase("checking");
+      setSetupError(null);
+      setSetupProgress(null);
 
-      if (cancelled) {
-        return;
-      }
+      try {
+        let status = await invoke<RuntimeSetupStatus>("get_runtime_setup_status");
+        if (!status.ready) {
+          if (!cancelled) {
+            setSetupPhase("installing");
+          }
+          status = await invoke<RuntimeSetupStatus>("setup_runtime_dependencies");
+        }
 
-      if (installationResult.status === "fulfilled") {
+        if (cancelled) {
+          return;
+        }
+
+        if (!status.ready) {
+          throw new Error(status.message);
+        }
+
         setToolStatus({
-          message: `yt-dlp ${installationResult.value.version} is ready.`,
+          message: status.ytDlpVersion
+            ? `yt-dlp ${status.ytDlpVersion} is ready with private ffmpeg and ffprobe.`
+            : "Private yt-dlp, ffmpeg, and ffprobe tools are ready.",
           tone: "success",
         });
-      } else {
-        setToolStatus({ message: errorMessage(installationResult.reason), tone: "error" });
+        setSetupPhase("ready");
+      } catch (error) {
+        if (!cancelled) {
+          setSetupError(errorMessage(error));
+          setSetupPhase("error");
+        }
       }
-      setIsCheckingInstallation(false);
-
-      if (pathResult.status === "fulfilled") {
-        setDownloadPath(pathResult.value);
-      } else {
-        setNotice({
-          message: `Could not load the saved destination: ${errorMessage(pathResult.reason)}`,
-          tone: "error",
-        });
-      }
-      setIsLoadingPath(false);
     };
 
-    void initialise();
+    void prepareRuntime();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [setupAttempt]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadDownloadPath = async () => {
+      try {
+        const savedPath = await invoke<string>("get_download_path");
+        if (!cancelled) {
+          setDownloadPath(savedPath);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setNotice({
+            message: `Could not load the saved destination: ${errorMessage(error)}`,
+            tone: "error",
+          });
+        }
+      } finally {
+        if (!cancelled) {
+          setIsLoadingPath(false);
+        }
+      }
+    };
+
+    void loadDownloadPath();
 
     return () => {
       cancelled = true;
@@ -170,23 +312,6 @@ function App() {
       unlisten?.();
     };
   }, []);
-
-  const handleCheckInstallation = async () => {
-    setIsCheckingInstallation(true);
-    setToolStatus({ message: "Checking yt-dlp…", tone: "neutral" });
-
-    try {
-      const installation = await invoke<InstallationStatus>("check_installation");
-      setToolStatus({
-        message: `yt-dlp ${installation.version} is ready.`,
-        tone: "success",
-      });
-    } catch (error) {
-      setToolStatus({ message: errorMessage(error), tone: "error" });
-    } finally {
-      setIsCheckingInstallation(false);
-    }
-  };
 
   const handleSelectPath = async () => {
     setIsSelectingPath(true);
@@ -321,14 +446,6 @@ function App() {
       return;
     }
 
-    if (toolStatus.tone === "error") {
-      setNotice({
-        message: "yt-dlp must be available before a download can start.",
-        tone: "error",
-      });
-      return;
-    }
-
     await startDownload({ url: trimmedUrl, downloadType, path: trimmedPath });
   };
 
@@ -367,10 +484,21 @@ function App() {
     }
   };
 
-  const isInitializing = isCheckingInstallation || isLoadingPath;
-  const downloadUnavailable =
-    isInitializing || isSelectingPath || isDownloading || toolStatus.tone !== "success";
+  const downloadUnavailable = isLoadingPath || isSelectingPath || isDownloading;
   const isPodcast = downloadType === "podcast";
+
+  if (setupPhase !== "ready") {
+    return (
+      <SetupScreen
+        phase={setupPhase}
+        progress={setupProgress}
+        error={setupError}
+        onRetry={() => {
+          setSetupAttempt((attempt) => attempt + 1);
+        }}
+      />
+    );
+  }
 
   return (
     <main className="app-shell">
@@ -392,16 +520,6 @@ function App() {
         <div className={`tool-status ${toolStatus.tone}`} aria-live="polite">
           <span className="status-indicator" aria-hidden="true" />
           <span>{toolStatus.message}</span>
-          {toolStatus.tone === "error" && (
-            <button
-              type="button"
-              className="text-button"
-              onClick={handleCheckInstallation}
-              disabled={isCheckingInstallation || isDownloading}
-            >
-              Try again
-            </button>
-          )}
         </div>
 
         <form noValidate onSubmit={handleDownload}>
@@ -505,7 +623,7 @@ function App() {
                 type="button"
                 className="secondary-button"
                 onClick={handleSelectPath}
-                disabled={isInitializing || isDownloading || isSelectingPath}
+                disabled={isLoadingPath || isDownloading || isSelectingPath}
               >
                 {isSelectingPath ? "Opening…" : "Choose folder"}
               </button>
