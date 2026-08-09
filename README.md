@@ -8,6 +8,8 @@ This is a Tauri-based desktop application for downloading audio from YouTube and
 - Download every available episode from a public podcast RSS feed
 - Save audio files in MP3 format with high quality (320K)
 - Select and save a custom download path
+- Live progress bar with item counts for playlist and podcast downloads
+- Pause and resume long downloads, or stop them outright, without freezing the UI
 - Cross-platform support (Windows, macOS, Linux)
 
 ## Downloading a podcast RSS feed
@@ -16,9 +18,16 @@ This is a Tauri-based desktop application for downloading audio from YouTube and
 2. Paste a public `http` or `https` RSS feed URL.
 3. Choose the parent download destination and select **Download podcast**.
 
-The app asks `yt-dlp` to verify that the URL is an episode playlist, derives a safe folder name from the podcast title, and creates that folder inside the selected destination. All available episodes are saved there. The status area shows the current episode when `yt-dlp` reports progress.
+The app asks `yt-dlp` to verify that the URL is an episode playlist, derives a safe folder name from the podcast title, and creates that folder inside the selected destination. All available episodes are saved there. A progress bar shows how many episodes are finished and how many remain, along with the current episode's percent complete.
 
-Feeds that require authentication, are not recognized by `yt-dlp` as a playlist, or contain no downloadable episodes are rejected before the full download begins. Very large feeds can take a long time and may leave already completed episodes in the podcast folder if a later episode fails.
+Feeds that require authentication, are not recognized by `yt-dlp` as a playlist, or contain no downloadable episodes are rejected before the full download begins. Very large feeds can take a long time; the download now runs off the UI thread so the app stays responsive throughout.
+
+## Progress, pause, and stop
+
+Playlist and podcast downloads run in the background and report progress (current/total items and percent) as `yt-dlp` processes each item, so the app never locks up on large feeds or playlists.
+
+- **Pause** stops the current `yt-dlp` process but remembers which items already finished (via a per-source download archive), so **Resume** picks up where it left off instead of re-downloading everything.
+- **Stop** ends the download immediately and clears its saved progress, so a future download of the same source starts fresh.
 
 ## Prerequisites
 

@@ -329,6 +329,75 @@ input[type="url"]:focus-visible {
   margin: 1.15rem 0 0;
 }
 
+.progress-panel {
+  display: grid;
+  gap: 0.5rem;
+  margin-top: 1rem;
+  padding: 0.85rem 1rem;
+  border: 1px solid #d5deeb;
+  border-radius: 0.75rem;
+  background: #f8fafd;
+}
+
+.progress-meta {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+  font-size: 0.86rem;
+  color: #4b5b75;
+}
+
+.progress-meta strong {
+  color: #172033;
+}
+
+.progress-bar-track {
+  width: 100%;
+  height: 0.6rem;
+  border-radius: 999px;
+  background: #e2e9f6;
+  overflow: hidden;
+}
+
+.progress-bar-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(135deg, #3d65ce, #294da9);
+  transition: width 200ms ease;
+}
+
+.download-controls {
+  display: flex;
+  gap: 0.6rem;
+  margin-top: 0.85rem;
+}
+
+.control-button {
+  flex: 1;
+  border: 0;
+  border-radius: 0.65rem;
+  padding: 0.72rem 1rem;
+  font-weight: 750;
+  font-size: 0.9rem;
+  color: #294a9e;
+  background: #e9efff;
+  transition: background-color 150ms ease;
+}
+
+.control-button:not(:disabled):hover {
+  background: #dce7ff;
+}
+
+.control-button.danger {
+  color: #8a1f1f;
+  background: #fde3e3;
+}
+
+.control-button.danger:not(:disabled):hover {
+  background: #fbd0d0;
+}
+
 @media (max-width: 560px) {
   .app-shell {
     padding: 0.75rem;

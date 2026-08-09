@@ -13,6 +13,7 @@ interface InstallationStatus {
 
 interface DownloadResult {
   message: string;
+  status: "completed" | "stopped" | "paused" | "stopping";
 }
 
 interface Notice {
@@ -20,10 +21,17 @@ interface Notice {
   tone: NoticeTone;
 }
 
-interface PodcastProgress {
+interface DownloadProgress {
   current: number;
   total: number;
   percent: string;
+  kind: "single" | "playlist" | "podcast";
+}
+
+interface StartedDownloadParams {
+  url: string;
+  downloadType: DownloadType;
+  path: string;
 }
 
 const YOUTUBE_HOSTS = ["youtube.com", "youtu.be", "youtube-nocookie.com"];
@@ -76,6 +84,11 @@ function App() {
   const [isLoadingPath, setIsLoadingPath] = useState(true);
   const [isSelectingPath, setIsSelectingPath] = useState(false);
   const [isDownloading, setIsDownloading] = useState(false);
+  const [isPaused, setIsPaused] = useState(false);
+  const [isPausing, setIsPausing] = useState(false);
+  const [isStopping, setIsStopping] = useState(false);
+  const [progress, setProgress] = useState<DownloadProgress | null>(null);
+  const [resumeParams, setResumeParams] = useState<StartedDownloadParams | null>(null);
   const [toolStatus, setToolStatus] = useState<Notice>({
     message: "Checking yt-dlp…",
     tone: "neutral",
@@ -130,14 +143,10 @@ function App() {
     let unlisten: (() => void) | undefined;
     let disposed = false;
 
-    void listen<PodcastProgress>("podcast-download-progress", (event) => {
-      const { current, total, percent } = event.payload;
+    void listen<DownloadProgress>("download-progress", (event) => {
+      const { current, total } = event.payload;
       if (current > 0 && total > 0) {
-        const progress = percent ? ` (${percent})` : "";
-        setNotice({
-          message: `Downloading podcast episode ${current} of ${total}${progress}…`,
-          tone: "neutral",
-        });
+        setProgress(event.payload);
       }
     })
       .then((stopListening) => {
@@ -150,7 +159,7 @@ function App() {
       .catch(() => {
         if (!disposed) {
           setNotice({
-            message: "Podcast download progress is unavailable, but downloads can still run.",
+            message: "Download progress is unavailable, but downloads can still run.",
             tone: "neutral",
           });
         }
@@ -210,6 +219,67 @@ function App() {
     }
   };
 
+  const startDownload = async (params: StartedDownloadParams) => {
+    const { url: startUrl, downloadType: startType, path: startPath } = params;
+
+    setIsDownloading(true);
+    setIsPaused(false);
+    setProgress(null);
+    setResumeParams(params);
+    setNotice({
+      message:
+        startType === "podcast"
+          ? "Checking the podcast feed and preparing its folder…"
+          : "Downloading audio. This can take a few minutes…",
+      tone: "neutral",
+    });
+
+    try {
+      const result =
+        startType === "podcast"
+          ? await invoke<DownloadResult>("download_podcast", {
+              url: startUrl,
+              path: startPath,
+            })
+          : await invoke<DownloadResult>("download_audio", {
+              url: startUrl,
+              downloadType: startType,
+              path: startPath,
+            });
+
+      if (result.status === "paused") {
+        setIsPaused(true);
+        setNotice({ message: result.message, tone: "neutral" });
+      } else {
+        setIsPaused(false);
+        setResumeParams(null);
+        setProgress(null);
+        setNotice({
+          message: result.message,
+          tone: result.status === "stopped" ? "neutral" : "success",
+        });
+      }
+    } catch (error) {
+      setIsPaused(false);
+      setResumeParams(null);
+      setProgress(null);
+      setNotice({
+        message: `Download failed: ${errorMessage(error)}`,
+        tone: "error",
+      });
+    } finally {
+      setIsDownloading(false);
+    }
+  };
+
+  const resetPauseStateIfNeeded = () => {
+    if (isPaused) {
+      setIsPaused(false);
+      setResumeParams(null);
+      setProgress(null);
+    }
+  };
+
   const handleDownload = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
 
@@ -259,35 +329,41 @@ function App() {
       return;
     }
 
-    setIsDownloading(true);
-    setNotice({
-      message:
-        downloadType === "podcast"
-          ? "Checking the podcast feed and preparing its folder…"
-          : "Downloading audio. This can take a few minutes…",
-      tone: "neutral",
-    });
+    await startDownload({ url: trimmedUrl, downloadType, path: trimmedPath });
+  };
 
+  const handleResume = async () => {
+    if (!resumeParams) {
+      return;
+    }
+    await startDownload(resumeParams);
+  };
+
+  const handlePause = async () => {
+    setIsPausing(true);
     try {
-      const result =
-        downloadType === "podcast"
-          ? await invoke<DownloadResult>("download_podcast", {
-              url: trimmedUrl,
-              path: trimmedPath,
-            })
-          : await invoke<DownloadResult>("download_audio", {
-              url: trimmedUrl,
-              downloadType,
-              path: trimmedPath,
-            });
-      setNotice({ message: result.message, tone: "success" });
+      await invoke<DownloadResult>("pause_download");
     } catch (error) {
       setNotice({
-        message: `Download failed: ${errorMessage(error)}`,
+        message: `Could not pause the download: ${errorMessage(error)}`,
         tone: "error",
       });
     } finally {
-      setIsDownloading(false);
+      setIsPausing(false);
+    }
+  };
+
+  const handleStop = async () => {
+    setIsStopping(true);
+    try {
+      await invoke<DownloadResult>("stop_download");
+    } catch (error) {
+      setNotice({
+        message: `Could not stop the download: ${errorMessage(error)}`,
+        tone: "error",
+      });
+    } finally {
+      setIsStopping(false);
     }
   };
 
@@ -338,7 +414,10 @@ function App() {
               inputMode="url"
               autoComplete="url"
               value={url}
-              onChange={(event) => setUrl(event.target.value)}
+              onChange={(event) => {
+                setUrl(event.target.value);
+                resetPauseStateIfNeeded();
+              }}
               placeholder={
                 isPodcast
                   ? "https://example.com/podcast.rss"
@@ -363,7 +442,10 @@ function App() {
                 name="download-type"
                 value="single"
                 checked={downloadType === "single"}
-                onChange={() => setDownloadType("single")}
+                onChange={() => {
+                  setDownloadType("single");
+                  resetPauseStateIfNeeded();
+                }}
                 disabled={isDownloading}
               />
               <span>
@@ -377,7 +459,10 @@ function App() {
                 name="download-type"
                 value="playlist"
                 checked={downloadType === "playlist"}
-                onChange={() => setDownloadType("playlist")}
+                onChange={() => {
+                  setDownloadType("playlist");
+                  resetPauseStateIfNeeded();
+                }}
                 disabled={isDownloading}
               />
               <span>
@@ -391,7 +476,10 @@ function App() {
                 name="download-type"
                 value="podcast"
                 checked={downloadType === "podcast"}
-                onChange={() => setDownloadType("podcast")}
+                onChange={() => {
+                  setDownloadType("podcast");
+                  resetPauseStateIfNeeded();
+                }}
                 disabled={isDownloading}
               />
               <span>
@@ -424,10 +512,71 @@ function App() {
             </div>
           </div>
 
-          <button className="download-button" type="submit" disabled={downloadUnavailable}>
+          <button
+            className="download-button"
+            type="submit"
+            disabled={downloadUnavailable && !isPaused}
+            style={{ display: isPaused ? "none" : undefined }}
+          >
             {isDownloading ? "Downloading…" : isPodcast ? "Download podcast" : "Download MP3"}
           </button>
+
+          {isPaused && (
+            <button
+              className="download-button"
+              type="button"
+              onClick={handleResume}
+              disabled={isPausing || isStopping}
+            >
+              Resume download
+            </button>
+          )}
         </form>
+
+        {(isDownloading || progress) && (
+          <div className="progress-panel" aria-live="polite">
+            <div className="progress-meta">
+              <span>
+                {progress
+                  ? `${progress.current} of ${progress.total} ${
+                      progress.kind === "podcast" ? "episodes" : "items"
+                    } downloaded`
+                  : "Preparing download…"}
+              </span>
+              <strong>{progress?.percent ?? ""}</strong>
+            </div>
+            <div className="progress-bar-track">
+              <div
+                className="progress-bar-fill"
+                style={{
+                  width: progress
+                    ? `${Math.min(100, Math.round((progress.current / progress.total) * 100))}%`
+                    : "0%",
+                }}
+              />
+            </div>
+            {isDownloading && (
+              <div className="download-controls">
+                <button
+                  type="button"
+                  className="control-button"
+                  onClick={handlePause}
+                  disabled={isPausing || isStopping}
+                >
+                  {isPausing ? "Pausing…" : "Pause"}
+                </button>
+                <button
+                  type="button"
+                  className="control-button danger"
+                  onClick={handleStop}
+                  disabled={isPausing || isStopping}
+                >
+                  {isStopping ? "Stopping…" : "Stop"}
+                </button>
+              </div>
+            )}
+          </div>
+        )}
 
         <p className={`notice ${notice.tone}`} role={notice.tone === "error" ? "alert" : "status"} aria-live="polite">
           {notice.message}

@@ -69,6 +69,10 @@ When UI or native behavior changes, also QA the affected flow in `npm run tauri 
 
 For pure documentation changes, do not run builds. For configuration or packaging changes, use `npm run tauri build` when the platform prerequisites are available.
 
+## Terminal output
+
+Keep terminal/CLI output minimal while working: prefer quiet/`--quiet` flags, pipe verbose command output through `grep`/`head`/`tail` or targeted `view_range` reads, and avoid dumping full file contents or long logs into the terminal when a smaller, targeted excerpt answers the question.
+
 ## Completion criteria
 
 Before handing off, ensure the change is wired across every affected layer, the relevant commands complete successfully, errors are understandable to users, and validation output contains no new failures. State what changed and any validation that could not run because of an environment limitation.

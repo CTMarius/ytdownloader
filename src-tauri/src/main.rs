@@ -1,12 +1,19 @@
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::hash_map::DefaultHasher,
     fs,
+    hash::{Hash, Hasher},
     io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
+    process::{Child, Command, Output, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     thread,
+    time::Duration,
 };
-use tauri::{command, Emitter};
+use tauri::{command, AppHandle, Emitter, State};
 use url::Url;
 
 const SETTINGS_FILE: &str = ".yt-dlp-tauri-settings";
@@ -23,9 +30,13 @@ struct InstallationStatus {
     version: String,
 }
 
+/// The outcome of a download command. `status` lets the UI distinguish a
+/// completed download from one that the user paused or stopped, all of
+/// which resolve the invoke promise successfully rather than as an error.
 #[derive(Serialize)]
 struct DownloadResult {
     message: String,
+    status: String,
 }
 
 #[derive(Deserialize)]
@@ -37,10 +48,21 @@ struct PodcastPlaylistMetadata {
 }
 
 #[derive(Clone, Serialize)]
-struct PodcastProgress {
+struct DownloadProgress {
     current: usize,
     total: usize,
     percent: String,
+    kind: String,
+}
+
+/// Tracks the currently running `yt-dlp` process (if any) so it can be
+/// stopped or paused from a separate command invocation, without blocking
+/// the UI thread while a download is in progress.
+#[derive(Default)]
+struct DownloadManager {
+    child: Arc<Mutex<Option<Arc<Mutex<Child>>>>>,
+    stop_requested: Arc<AtomicBool>,
+    pause_requested: Arc<AtomicBool>,
 }
 
 #[command]
@@ -112,13 +134,20 @@ fn get_download_path() -> Result<String, String> {
 }
 
 #[command]
-fn download_audio(
+async fn download_audio(
+    app: AppHandle,
+    state: State<'_, DownloadManager>,
     url: String,
     download_type: DownloadType,
     path: String,
 ) -> Result<DownloadResult, String> {
     let url = validate_youtube_url(&url)?;
     let download_path = validate_download_directory(&path)?;
+    let kind = match download_type {
+        DownloadType::Single => "single",
+        DownloadType::Playlist => "playlist",
+    };
+    let archive_path = archive_path_for(kind, &url)?;
 
     let mut command = Command::new("yt-dlp");
     command
@@ -127,52 +156,45 @@ fn download_audio(
         .arg("mp3")
         .arg("--audio-quality")
         .arg("320K")
+        .arg("--newline")
+        .arg("--download-archive")
+        .arg(&archive_path)
         .arg("--paths")
-        .arg(download_path)
+        .arg(&download_path)
         .arg("--output");
 
     match download_type {
         DownloadType::Single => {
             command
                 .arg("%(uploader)s/%(title)s.%(ext)s")
-                .arg("--no-playlist");
+                .arg("--no-playlist")
+                .arg("--progress-template")
+                .arg("download-progress:1/1:%(progress._percent_str)s");
         }
         DownloadType::Playlist => {
-            command.arg("%(uploader)s/%(playlist_index)02d - %(title)s.%(ext)s");
+            command
+                .arg("%(uploader)s/%(playlist_index)02d - %(title)s.%(ext)s")
+                .arg("--progress-template")
+                .arg(
+                    "download-progress:%(info.playlist_index)s/%(info.playlist_count)s:%(progress._percent_str)s",
+                );
         }
     }
 
-    let output = command
-        .arg("--")
-        .arg(url.as_str())
-        .output()
-        .map_err(|error| match error.kind() {
-            std::io::ErrorKind::NotFound => {
-                "yt-dlp was not found. Install yt-dlp and restart the application.".to_string()
-            }
-            _ => format!("Could not start yt-dlp: {error}"),
-        })?;
+    command.arg("--").arg(url.as_str());
 
-    if !output.status.success() {
-        return Err(format!(
-            "yt-dlp failed: {}",
-            command_output_message(&output)
-        ));
-    }
-
-    let message = match download_type {
-        DownloadType::Single => "Finished downloading the video as an MP3.",
-        DownloadType::Playlist => "Finished downloading playlist audio as MP3 files.",
+    let success_message = match download_type {
+        DownloadType::Single => "Finished downloading the video as an MP3.".to_string(),
+        DownloadType::Playlist => "Finished downloading playlist audio as MP3 files.".to_string(),
     };
 
-    Ok(DownloadResult {
-        message: message.to_string(),
-    })
+    run_monitored_download(&state, &app, kind, archive_path, command, success_message).await
 }
 
 #[command]
-fn download_podcast(
-    app: tauri::AppHandle,
+async fn download_podcast(
+    app: AppHandle,
+    state: State<'_, DownloadManager>,
     url: String,
     path: String,
 ) -> Result<DownloadResult, String> {
@@ -181,6 +203,7 @@ fn download_podcast(
     let metadata = read_podcast_metadata(&url)?;
     let folder_name = sanitize_podcast_folder_title(metadata.title.as_deref().unwrap_or_default());
     let podcast_path = create_podcast_directory(&download_path, &folder_name)?;
+    let archive_path = archive_path_for("podcast", &url)?;
 
     let mut command = Command::new("yt-dlp");
     command
@@ -191,64 +214,209 @@ fn download_podcast(
         .arg("320K")
         .arg("--yes-playlist")
         .arg("--newline")
+        .arg("--download-archive")
+        .arg(&archive_path)
         .arg("--progress-template")
-        .arg("podcast-progress:%(info.playlist_index)s/%(info.playlist_count)s:%(progress._percent_str)s")
+        .arg(
+            "download-progress:%(info.playlist_index)s/%(info.playlist_count)s:%(progress._percent_str)s",
+        )
         .arg("--paths")
         .arg(&podcast_path)
         .arg("--output")
         .arg("%(playlist_index)04d - %(title)s.%(ext)s")
         .arg("--")
-        .arg(url.as_str())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .arg(url.as_str());
 
-    let mut child = command.spawn().map_err(|error| match error.kind() {
-        std::io::ErrorKind::NotFound => {
-            "yt-dlp was not found. Install yt-dlp and restart the application.".to_string()
-        }
-        _ => format!("Could not start yt-dlp: {error}"),
-    })?;
+    let success_message = format!(
+        "Finished downloading all available podcast episodes to the “{folder_name}” folder."
+    );
 
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "Could not read yt-dlp download progress.".to_string())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "Could not read yt-dlp download errors.".to_string())?;
-    let progress_app = app.clone();
-    let progress_reader = thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if let Some(progress) = parse_podcast_progress(&line) {
-                let _ = progress_app.emit("podcast-download-progress", progress);
-            }
-        }
-    });
-    let error_reader = thread::spawn(move || {
-        let mut output = String::new();
-        let _ = BufReader::new(stderr).read_to_string(&mut output);
-        output
-    });
+    run_monitored_download(&state, &app, "podcast", archive_path, command, success_message).await
+}
 
-    let status = child
-        .wait()
-        .map_err(|error| format!("Could not wait for yt-dlp to finish: {error}"))?;
-    let _ = progress_reader.join();
-    let _ = error_reader.join();
+/// Requests that the active download stop or pause. Both simply terminate the
+/// running `yt-dlp` process (it is not truly suspendable across platforms);
+/// the difference is that stopping also clears saved progress so a future
+/// download starts fresh, while pausing keeps it so Resume can skip
+/// already-completed items via `--download-archive`.
+fn request_download_interruption(
+    state: &DownloadManager,
+    stop: bool,
+) -> Result<DownloadResult, String> {
+    let guard = state.child.lock().unwrap();
+    let Some(child_arc) = guard.as_ref() else {
+        return Err("No download is currently running.".to_string());
+    };
 
-    if !status.success() {
-        return Err(
-            "Podcast download stopped before all episodes were processed. Check that the feed is public, the destination is writable, and ffmpeg is installed for audio conversion. Episodes completed before the error may already be in the podcast folder."
-                .to_string(),
-        );
+    if stop {
+        state.stop_requested.store(true, Ordering::SeqCst);
+    } else {
+        state.pause_requested.store(true, Ordering::SeqCst);
     }
 
+    child_arc
+        .lock()
+        .unwrap()
+        .kill()
+        .map_err(|error| format!("Could not stop the download: {error}"))?;
+
     Ok(DownloadResult {
-        message: format!(
-            "Finished downloading all available podcast episodes to the “{folder_name}” folder."
-        ),
+        message: if stop {
+            "Stopping the download…".to_string()
+        } else {
+            "Pausing the download…".to_string()
+        },
+        status: "stopping".to_string(),
     })
+}
+
+#[command]
+fn stop_download(state: State<'_, DownloadManager>) -> Result<DownloadResult, String> {
+    request_download_interruption(&state, true)
+}
+
+#[command]
+fn pause_download(state: State<'_, DownloadManager>) -> Result<DownloadResult, String> {
+    request_download_interruption(&state, false)
+}
+
+/// Runs `yt-dlp` on a dedicated blocking thread (so the UI never freezes),
+/// streams progress events to the frontend, and tracks the child process in
+/// `DownloadManager` so `stop_download`/`pause_download` can interrupt it.
+async fn run_monitored_download(
+    state: &DownloadManager,
+    app: &AppHandle,
+    kind: &'static str,
+    archive_path: PathBuf,
+    mut command: Command,
+    success_message: String,
+) -> Result<DownloadResult, String> {
+    let child_slot = state.child.clone();
+    let stop_flag = state.stop_requested.clone();
+    let pause_flag = state.pause_requested.clone();
+    let progress_app = app.clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        stop_flag.store(false, Ordering::SeqCst);
+        pause_flag.store(false, Ordering::SeqCst);
+
+        let mut child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| match error.kind() {
+                std::io::ErrorKind::NotFound => {
+                    "yt-dlp was not found. Install yt-dlp and restart the application.".to_string()
+                }
+                _ => format!("Could not start yt-dlp: {error}"),
+            })?;
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "Could not read yt-dlp download progress.".to_string())?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "Could not read yt-dlp download errors.".to_string())?;
+
+        let progress_kind = kind.to_string();
+        let progress_reader = thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Some((current, total, percent)) = parse_download_progress(&line) {
+                    let _ = progress_app.emit(
+                        "download-progress",
+                        DownloadProgress {
+                            current,
+                            total,
+                            percent,
+                            kind: progress_kind.clone(),
+                        },
+                    );
+                }
+            }
+        });
+        let error_reader = thread::spawn(move || {
+            let mut output = String::new();
+            let _ = BufReader::new(stderr).read_to_string(&mut output);
+            output
+        });
+
+        let child_arc = Arc::new(Mutex::new(child));
+        *child_slot.lock().unwrap() = Some(child_arc.clone());
+
+        let status = loop {
+            let wait_result = child_arc.lock().unwrap().try_wait();
+            match wait_result {
+                Ok(Some(status)) => break status,
+                Ok(None) => thread::sleep(Duration::from_millis(150)),
+                Err(error) => {
+                    *child_slot.lock().unwrap() = None;
+                    return Err(format!("Could not wait for yt-dlp to finish: {error}"));
+                }
+            }
+        };
+
+        *child_slot.lock().unwrap() = None;
+        let _ = progress_reader.join();
+        let error_output = error_reader.join().unwrap_or_default();
+
+        let was_stopped = stop_flag.swap(false, Ordering::SeqCst);
+        let was_paused = pause_flag.swap(false, Ordering::SeqCst);
+
+        if was_stopped {
+            let _ = fs::remove_file(&archive_path);
+            return Ok(DownloadResult {
+                message: "Download stopped. Progress for this download was cleared.".to_string(),
+                status: "stopped".to_string(),
+            });
+        }
+
+        if was_paused {
+            return Ok(DownloadResult {
+                message: "Download paused. Resume anytime to continue from where it left off."
+                    .to_string(),
+                status: "paused".to_string(),
+            });
+        }
+
+        if !status.success() {
+            let details = if error_output.trim().is_empty() {
+                format!("process exited with status {status}")
+            } else {
+                error_output.chars().take(1_000).collect::<String>()
+            };
+            return Err(format!(
+                "yt-dlp stopped before finishing. Check that the source is public, the destination is writable, and ffmpeg is installed for audio conversion: {details}"
+            ));
+        }
+
+        let _ = fs::remove_file(&archive_path);
+        Ok(DownloadResult {
+            message: success_message,
+            status: "completed".to_string(),
+        })
+    })
+    .await
+    .map_err(|error| format!("The download task ended unexpectedly: {error}"))?
+}
+
+/// Derives a stable, per-source path for `yt-dlp`'s `--download-archive`
+/// file so pausing and resuming the same URL skips already-downloaded items.
+fn archive_path_for(kind: &str, url: &Url) -> Result<PathBuf, String> {
+    let mut hasher = DefaultHasher::new();
+    url.as_str().hash(&mut hasher);
+    let hash = hasher.finish();
+
+    let base = dirs::cache_dir()
+        .or_else(dirs::home_dir)
+        .ok_or_else(|| "Could not determine a location to track download progress.".to_string())?
+        .join("yt-dlp-tauri")
+        .join("archives");
+    fs::create_dir_all(&base)
+        .map_err(|error| format!("Could not prepare download progress tracking: {error}"))?;
+
+    Ok(base.join(format!("{kind}-{hash:x}.txt")))
 }
 
 fn settings_path() -> Result<PathBuf, String> {
@@ -454,18 +622,14 @@ fn sanitize_podcast_folder_title(title: &str) -> String {
     folder_name
 }
 
-fn parse_podcast_progress(line: &str) -> Option<PodcastProgress> {
-    let progress = line.strip_prefix("podcast-progress:")?;
-    let (episode, percent) = progress.split_once(':')?;
-    let (current, total) = episode.split_once('/')?;
+fn parse_download_progress(line: &str) -> Option<(usize, usize, String)> {
+    let progress = line.strip_prefix("download-progress:")?;
+    let (item, percent) = progress.split_once(':')?;
+    let (current, total) = item.split_once('/')?;
     let current = current.trim().parse().ok()?;
     let total = total.trim().parse().ok()?;
 
-    Some(PodcastProgress {
-        current,
-        total,
-        percent: percent.trim().chars().take(12).collect(),
-    })
+    Some((current, total, percent.trim().chars().take(12).collect()))
 }
 
 fn command_output_message(output: &Output) -> String {
@@ -493,12 +657,15 @@ fn path_to_string(path: &Path) -> Result<String, String> {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .manage(DownloadManager::default())
         .invoke_handler(tauri::generate_handler![
             check_installation,
             save_download_path,
             get_download_path,
             download_audio,
-            download_podcast
+            download_podcast,
+            stop_download,
+            pause_download
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tauri application");
@@ -507,7 +674,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_podcast_progress, sanitize_podcast_folder_title, validate_podcast_feed_url,
+        parse_download_progress, sanitize_podcast_folder_title, validate_podcast_feed_url,
         validate_youtube_url,
     };
 
@@ -541,11 +708,12 @@ mod tests {
     }
 
     #[test]
-    fn parses_yt_dlp_podcast_progress_lines() {
-        let progress = parse_podcast_progress("podcast-progress:17/2857: 42.5%").unwrap();
-        assert_eq!(progress.current, 17);
-        assert_eq!(progress.total, 2857);
-        assert_eq!(progress.percent, "42.5%");
-        assert!(parse_podcast_progress("unrelated output").is_none());
+    fn parses_yt_dlp_download_progress_lines() {
+        let (current, total, percent) =
+            parse_download_progress("download-progress:17/2857: 42.5%").unwrap();
+        assert_eq!(current, 17);
+        assert_eq!(total, 2857);
+        assert_eq!(percent, "42.5%");
+        assert!(parse_download_progress("unrelated output").is_none());
     }
 }
