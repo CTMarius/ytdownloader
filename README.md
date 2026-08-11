@@ -49,10 +49,12 @@ Feeds that require authentication, are not recognized by `yt-dlp` as a playlist,
 
 ## Progress, pause, and stop
 
-Playlist and podcast downloads run in the background and report progress (current/total items and percent) as `yt-dlp` processes each item, so the app never locks up on large feeds or playlists.
+Playlist and podcast downloads run in the background with up to four concurrent item workers. The
+app still runs only one playlist, podcast, or single-video job at a time, and reports aggregate
+completed/total progress plus active workers so the app never locks up on large feeds or playlists.
 
-- **Pause** stops the current `yt-dlp` process but remembers which items already finished (via a per-source download archive), so **Resume** picks up where it left off instead of re-downloading everything.
-- **Stop** ends the download immediately and clears its saved progress, so a future download of the same source starts fresh.
+- **Pause** stops every active worker and remembers checkpointed items, so **Resume** picks up where it left off instead of re-downloading completed items.
+- **Stop** waits for every active worker to exit, then clears saved progress so a future download of the same source starts fresh.
 
 ## Prerequisites
 
@@ -139,6 +141,5 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## Support
 
 If you encounter any issues or have questions, please file an issue on the GitHub repository.
-
 
 

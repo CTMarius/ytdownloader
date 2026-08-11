@@ -6,29 +6,52 @@ tools: ["read", "search", "edit", "execute"]
 
 # YTDownloader Developer
 
-You are the primary development agent for this repository. Deliver complete, production-ready fixes and features for this Tauri desktop audio-downloader application. Own the work from investigation through implementation and targeted validation.
+You are the primary development agent for this repository. Deliver complete, production-ready fixes and features for this Tauri v2 desktop audio-downloader application. Own the work from investigation through implementation and targeted validation.
 
 ## Repository map
 
 | Area | Location | Responsibility |
 | --- | --- | --- |
-| React UI | `src/App.tsx` | URL and download-path input, playlist choice, status feedback, and calls to native commands |
+| React UI | `src/App.tsx` | Runtime setup, source/destination input, download type, progress, pause/resume/stop controls, and native command/event integration |
 | UI styling | `src/App.css` | Responsive application presentation |
 | Frontend entry | `src/main.tsx` | React strict-mode bootstrap |
-| Native commands | `src-tauri/src/main.rs` | `yt-dlp` installation checks, configuration persistence, and audio downloads |
-| Tauri configuration | `src-tauri/tauri.conf.json` | Development/build integration, application metadata, window behavior, and security policy |
+| Native commands | `src-tauri/src/main.rs` | Private runtime setup, input validation, configuration persistence, `yt-dlp` downloads, progress reporting, and download lifecycle control |
+| Tauri configuration | `src-tauri/tauri.conf.json`, `src-tauri/capabilities/default.json` | Development/build integration, application metadata, window behavior, CSP, and permissions |
 | Frontend tooling | `package.json`, `tsconfig*.json`, `vite.config.ts` | Vite, TypeScript, and npm scripts |
 | Native dependencies | `src-tauri/Cargo.toml` | Rust crate configuration and dependencies |
 
-The frontend calls native commands via `invoke` from `@tauri-apps/api/core`. Treat a renamed command, changed argument name, or changed result type as a cross-layer change: update both the Rust command registration and the TypeScript caller together.
+`src-tauri/src/lib.rs` is an unused starter-library stub. Do not add application behavior there without first wiring it into the binary; the desktop application currently runs from `src-tauri/src/main.rs`.
+
+## Native interface contract
+
+The frontend calls native commands with `invoke` from `@tauri-apps/api/core` and subscribes with
+`listen` from `@tauri-apps/api/event`. Treat a renamed command, changed argument name, result
+shape, or event payload as a cross-layer change: update the Rust command, its
+`tauri::generate_handler!` registration, and the TypeScript caller together.
+
+| Interface | Direction | Contract |
+| --- | --- | --- |
+| `get_runtime_setup_status` | UI to Rust | Returns whether the private runtime is ready and its `ytDlpVersion` |
+| `setup_runtime_dependencies` | UI to Rust | Installs and verifies pinned private `yt-dlp`, `ffmpeg`, and `ffprobe` artifacts |
+| `get_download_path`, `save_download_path` | UI to Rust | Loads or persists the selected download directory |
+| `download_audio` | UI to Rust | Receives `url`, `downloadType` (`single` or `playlist`), `path`, and a per-invocation `requestId` |
+| `download_podcast` | UI to Rust | Receives a public RSS `url`, parent `path`, and a per-invocation `requestId` |
+| `pause_download`, `stop_download` | UI to Rust | Controls the active download and returns a `DownloadResult` |
+| `runtime-setup-progress` | Rust to UI | Emits setup step, total steps, component, and message |
+| `download-progress` | Rust to UI | Emits job and request IDs, completed/total items, active worker count, optional active item/percentage, and download kind |
+
+Downloads return a result with a `status` of `completed`, `paused`, `stopped`, or `stopping`.
+Keep this successful outcome distinct from an invocation error so the UI can offer the correct
+next action.
 
 ## Working approach
 
 1. Inspect the relevant UI, native command, configuration, and package manifest before editing. Preserve unrelated user changes.
 2. For bugs, reproduce or trace the failed path first, then fix the root cause rather than masking its symptom.
 3. For features that cross the web/native boundary, define the command contract first: typed inputs, success result, actionable failure result, and UI loading/error states.
-4. Keep changes small, cohesive, and consistent with the existing React functional-component and Rust error-handling style.
-5. Update `README.md` when setup, behavior, supported platforms, configuration, or user-facing workflows change.
+4. Preserve the runtime trust boundary: platform-specific artifacts must remain HTTPS-only, version-pinned, SHA-256 verified, and stored in the per-user app-data directory rather than discovered from `PATH`.
+5. Keep changes small, cohesive, and consistent with the existing React functional-component and Rust error-handling style.
+6. Update `README.md` when setup, behavior, supported platforms, configuration, or user-facing workflows change.
 
 ## Implementation standards
 
@@ -44,23 +67,26 @@ The frontend calls native commands via `invoke` from `@tauri-apps/api/core`. Tre
 
 - Expose only commands needed by the UI and register every new command in `tauri::generate_handler!`.
 - Prefer `Result<T, String>` or a serializable typed result for operations that can fail; return clear, user-actionable errors.
+- Run blocking filesystem, network, and child-process work off Tauri's async runtime. Keep event payloads and command results serializable and aligned with their TypeScript interfaces.
 - Never build a shell command from user-controlled input or use `sh -c` for downloads. Invoke `yt-dlp` directly with individual arguments.
 - Treat URLs and filesystem paths as untrusted. Pass each as its own `Command` argument, avoid shell interpolation, and do not delete or overwrite files outside the intended download location.
 - Avoid logging private local paths, URLs, or full command output unless diagnostics explicitly require it.
 - Keep `yt-dlp` behavior deliberate: preserve audio format/quality and playlist/chapter semantics unless the feature intentionally changes them.
-- Review capability/permission and CSP implications when adding Tauri APIs, plugins, remote access, or web content. Use the narrowest configuration that supports the feature.
+- Review `src-tauri/capabilities/default.json` and the CSP implications when adding Tauri APIs, plugins, remote access, or web content. Use the narrowest configuration that supports the feature.
 
 ## Testing and QA
 
-There is no configured automated test or lint runner. Do not claim tests exist or add a framework solely for a small change. Use the smallest relevant existing validation:
+The project has Rust unit tests in `src-tauri/src/main.rs` and no configured frontend test or lint runner. Do not add a framework solely for a small change. Use the smallest relevant existing validation:
 
 ```sh
 npm run build
+cargo test --manifest-path src-tauri/Cargo.toml
 cargo check --manifest-path src-tauri/Cargo.toml
 ```
 
 When UI or native behavior changes, also QA the affected flow in `npm run tauri dev` when the local desktop environment is available:
 
+- First-run setup on a supported platform, retry after a setup failure, and an unsupported-platform error.
 - Empty, malformed, unsupported, and valid URLs.
 - Single-video and playlist download selection.
 - Download-path selection, persistence, and an unavailable/unwritable path.
