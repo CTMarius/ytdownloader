@@ -2,15 +2,14 @@ use reqwest::{blocking::Client, redirect::Policy};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::hash_map::DefaultHasher,
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
-    hash::{Hash, Hasher},
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        mpsc, Arc, Condvar, Mutex,
     },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -25,6 +24,14 @@ const RUNTIME_SCHEMA_VERSION: u8 = 1;
 const YT_DLP_VERSION: &str = "2026.07.04";
 const FFMPEG_RELEASE: &str = "b6.1.1";
 const MAX_RUNTIME_ASSET_BYTES: u64 = 500 * 1024 * 1024;
+const SETTINGS_SCHEMA_VERSION: u8 = 1;
+const DEFAULT_WORKER_COUNT: usize = 4;
+const MIN_WORKER_COUNT: usize = 1;
+const MAX_WORKER_COUNT: usize = 8;
+const CHECKPOINT_SCHEMA_VERSION: u8 = 1;
+const PLAYLIST_LAYOUT_VERSION: &str = "playlist-static-index-v1";
+const PODCAST_LAYOUT_VERSION: &str = "podcast-static-index-v1";
+const SINGLE_LAYOUT_VERSION: &str = "single-v1";
 
 #[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -66,6 +73,7 @@ struct RuntimeAsset {
     sha256: &'static str,
 }
 
+#[derive(Clone)]
 struct RuntimeTools {
     directory: PathBuf,
     yt_dlp: PathBuf,
@@ -77,40 +85,156 @@ struct RuntimeTools {
 /// completed download from one that the user paused or stopped, all of
 /// which resolve the invoke promise successfully rather than as an error.
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct DownloadResult {
     message: String,
     status: String,
 }
 
+/// The versioned, per-user settings persisted beside the historical
+/// plain-text destination file. Field names form the Tauri command contract.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadSettings {
+    schema_version: u8,
+    download_path: String,
+    worker_count: usize,
+}
+
 #[derive(Deserialize)]
-struct PodcastPlaylistMetadata {
+#[serde(rename_all = "camelCase")]
+struct DownloadSettingsInput {
+    download_path: String,
+    worker_count: usize,
+}
+
+#[derive(Deserialize)]
+struct PlaylistMetadata {
     title: Option<String>,
-    entries: Option<Vec<serde_json::Value>>,
+    entries: Option<Vec<PlaylistEntry>>,
     #[serde(rename = "_type")]
     item_type: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct PlaylistEntry {
+    id: Option<String>,
+    url: Option<String>,
+    webpage_url: Option<String>,
+    original_url: Option<String>,
+}
+
 #[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct DownloadProgress {
-    current: usize,
+    job_id: String,
+    request_id: String,
+    completed: usize,
     total: usize,
-    percent: String,
+    active: usize,
+    active_item: Option<usize>,
+    percent: Option<String>,
     kind: String,
 }
 
-/// Tracks the currently running `yt-dlp` process (if any) so it can be
-/// stopped or paused from a separate command invocation, without blocking
-/// the UI thread while a download is in progress.
-#[derive(Default)]
+/// Tracks one logical job and every child process it starts. A single
+/// application-level job can have several yt-dlp workers, but a second job
+/// is always rejected by the native layer.
+#[derive(Clone, Default)]
 struct DownloadManager {
-    child: Arc<Mutex<Option<Arc<Mutex<Child>>>>>,
+    active: Arc<(Mutex<Option<Arc<ActiveDownload>>>, Condvar)>,
+}
+
+struct ActiveDownload {
+    children: Arc<Mutex<Vec<Arc<Mutex<Child>>>>>,
     stop_requested: Arc<AtomicBool>,
     pause_requested: Arc<AtomicBool>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct DownloadCheckpoint {
+    schema_version: u8,
+    job_id: String,
+    completed: BTreeSet<String>,
+}
+
+#[derive(Clone)]
+struct DownloadItem {
+    checkpoint_key: String,
+    locator: String,
+    source_index: usize,
+}
+
+enum WorkerEvent {
+    Started(DownloadItem),
+    Progress {
+        checkpoint_key: String,
+        percent: String,
+    },
+    Finished {
+        item: DownloadItem,
+        result: WorkerResult,
+    },
+}
+
+enum WorkerResult {
+    Completed,
+    Interrupted,
+    Failed(String),
+}
+
+/// Runs one item from the coordinator queue. Keeping this boundary private lets
+/// the coordinator be exercised with controlled workers without changing the
+/// command or runtime-tool trust boundary.
+trait DownloadWorker: Send + Sync {
+    fn run(
+        &self,
+        active_job: &Arc<ActiveDownload>,
+        tools: &RuntimeTools,
+        download_path: &Path,
+        output_layout: &OutputLayout,
+        item: &DownloadItem,
+        sender: &mpsc::Sender<WorkerEvent>,
+    ) -> WorkerResult;
+}
+
+struct YtDlpDownloadWorker;
+
+impl DownloadWorker for YtDlpDownloadWorker {
+    fn run(
+        &self,
+        active_job: &Arc<ActiveDownload>,
+        tools: &RuntimeTools,
+        download_path: &Path,
+        output_layout: &OutputLayout,
+        item: &DownloadItem,
+        sender: &mpsc::Sender<WorkerEvent>,
+    ) -> WorkerResult {
+        run_download_worker(
+            active_job,
+            tools,
+            download_path,
+            output_layout,
+            item,
+            sender,
+        )
+    }
+}
+
+struct AggregateProgress {
+    completed: usize,
+    total: usize,
+    active: BTreeMap<String, (usize, Option<String>)>,
 }
 
 #[derive(Clone, Default)]
 struct RuntimeSetupManager {
     install_lock: Arc<Mutex<()>>,
+}
+
+#[derive(Clone, Default)]
+struct SettingsManager {
+    access_lock: Arc<Mutex<()>>,
 }
 
 #[command]
@@ -681,43 +805,39 @@ fn set_runtime_executable_permissions(_path: &Path) -> Result<(), String> {
 }
 
 #[command]
-fn save_download_path(path: String) -> Result<String, String> {
-    let download_path = validate_download_directory(&path)?;
-    fs::write(settings_path()?, path_to_string(&download_path)?)
-        .map_err(|error| format!("Could not save the download destination: {error}"))?;
+async fn save_download_settings(
+    settings: DownloadSettingsInput,
+    state: State<'_, SettingsManager>,
+) -> Result<DownloadSettings, String> {
+    let settings_manager = state.inner().clone();
 
-    path_to_string(&download_path)
+    tauri::async_runtime::spawn_blocking(move || {
+        let _access_guard = settings_manager.access_lock.lock().map_err(|_| {
+            "Saved download settings are unavailable. Restart the app and try again.".to_string()
+        })?;
+        let settings = download_settings_from_input(settings)?;
+        write_download_settings(&settings_path()?, &settings)?;
+        Ok(settings)
+    })
+    .await
+    .map_err(|error| format!("Could not save download settings: {error}"))?
 }
 
 #[command]
-fn get_download_path() -> Result<String, String> {
-    let path = settings_path()?;
+async fn get_download_settings(
+    state: State<'_, SettingsManager>,
+) -> Result<DownloadSettings, String> {
+    let settings_manager = state.inner().clone();
 
-    match fs::read_to_string(path) {
-        Ok(saved_path) => {
-            let saved_path = saved_path.trim();
-            if saved_path.is_empty() {
-                return Err(
-                    "The saved download destination is empty. Choose an existing folder."
-                        .to_string(),
-                );
-            }
-
-            path_to_string(&validate_download_directory(saved_path)?)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let default_path = default_download_directory()?;
-            fs::create_dir_all(&default_path).map_err(|error| {
-                format!("Could not create the default download destination: {error}")
-            })?;
-            path_to_string(&validate_download_directory(
-                default_path.to_string_lossy().as_ref(),
-            )?)
-        }
-        Err(error) => Err(format!(
-            "Could not read the saved download destination: {error}"
-        )),
-    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let _access_guard = settings_manager.access_lock.lock().map_err(|_| {
+            "Saved download settings are unavailable. Restart the app and try again.".to_string()
+        })?;
+        let default_path = default_download_directory()?;
+        load_or_create_download_settings(&settings_path()?, &default_path)
+    })
+    .await
+    .map_err(|error| format!("Could not load saved download settings: {error}"))?
 }
 
 #[command]
@@ -727,56 +847,88 @@ async fn download_audio(
     url: String,
     download_type: DownloadType,
     path: String,
+    request_id: String,
+    worker_count: usize,
 ) -> Result<DownloadResult, String> {
-    let url = validate_youtube_url(&url)?;
-    let download_path = validate_download_directory(&path)?;
-    let tools = resolve_runtime_tools(&app)?;
-    let kind = match download_type {
-        DownloadType::Single => "single",
-        DownloadType::Playlist => "playlist",
-    };
-    let archive_path = archive_path_for(kind, &url)?;
+    let manager = state.inner().clone();
+    let active_job = manager.claim_job()?;
+    let task_job = active_job.clone();
+    let task_app = app.clone();
 
-    let mut command = yt_dlp_command(&tools);
-    command
-        .arg("--extract-audio")
-        .arg("--audio-format")
-        .arg("mp3")
-        .arg("--audio-quality")
-        .arg("320K")
-        .arg("--newline")
-        .arg("--download-archive")
-        .arg(&archive_path)
-        .arg("--paths")
-        .arg(&download_path)
-        .arg("--output");
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let request_id = validate_request_id(request_id)?;
+        let url = validate_youtube_url(&url)?;
+        let download_path = validate_download_directory(&path)?;
+        let worker_count = validate_worker_count(worker_count)?;
+        let tools = resolve_runtime_tools(&task_app)?;
 
-    match download_type {
-        DownloadType::Single => {
-            command
-                .arg("%(uploader)s/%(title)s.%(ext)s")
-                .arg("--no-playlist")
-                .arg("--progress-template")
-                .arg("download-progress:1/1:%(progress._percent_str)s");
+        match download_type {
+            DownloadType::Single => {
+                let (job_id, checkpoint_path) =
+                    checkpoint_path_for("single", &url, &download_path, SINGLE_LAYOUT_VERSION)?;
+                if task_job.is_interrupted() {
+                    return finish_interruption(&task_job, &checkpoint_path);
+                }
+
+                run_coordinated_download(
+                    &task_job,
+                    &task_app,
+                    "single",
+                    job_id,
+                    &request_id,
+                    checkpoint_path,
+                    &tools,
+                    &download_path,
+                    vec![DownloadItem {
+                        checkpoint_key: "source".to_string(),
+                        locator: url.to_string(),
+                        source_index: 1,
+                    }],
+                    OutputLayout::Single,
+                    MIN_WORKER_COUNT,
+                    "Finished downloading the video as an MP3.".to_string(),
+                )
+            }
+            DownloadType::Playlist => {
+                let (job_id, checkpoint_path) =
+                    checkpoint_path_for("playlist", &url, &download_path, PLAYLIST_LAYOUT_VERSION)?;
+                let metadata = match read_playlist_metadata(&tools, &url, &task_job) {
+                    Ok(metadata) => metadata,
+                    Err(_) if task_job.is_interrupted() => {
+                        return finish_interruption(&task_job, &checkpoint_path);
+                    }
+                    Err(error) => return Err(error),
+                };
+                if task_job.is_interrupted() {
+                    return finish_interruption(&task_job, &checkpoint_path);
+                }
+                let items = playlist_items(&metadata, true)?;
+                let width = index_width(&items, 2);
+
+                run_coordinated_download(
+                    &task_job,
+                    &task_app,
+                    "playlist",
+                    job_id,
+                    &request_id,
+                    checkpoint_path,
+                    &tools,
+                    &download_path,
+                    items,
+                    OutputLayout::Indexed {
+                        width,
+                        include_uploader: true,
+                    },
+                    worker_count,
+                    "Finished downloading playlist audio as MP3 files.".to_string(),
+                )
+            }
         }
-        DownloadType::Playlist => {
-            command
-                .arg("%(uploader)s/%(playlist_index)02d - %(title)s.%(ext)s")
-                .arg("--progress-template")
-                .arg(
-                    "download-progress:%(info.playlist_index)s/%(info.playlist_count)s:%(progress._percent_str)s",
-                );
-        }
-    }
+    })
+    .await;
 
-    command.arg("--").arg(url.as_str());
-
-    let success_message = match download_type {
-        DownloadType::Single => "Finished downloading the video as an MP3.".to_string(),
-        DownloadType::Playlist => "Finished downloading playlist audio as MP3 files.".to_string(),
-    };
-
-    run_monitored_download(&state, &app, kind, archive_path, command, success_message).await
+    manager.release_job(&active_job);
+    result.map_err(|error| format!("The download task ended unexpectedly: {error}"))?
 }
 
 #[command]
@@ -785,96 +937,74 @@ async fn download_podcast(
     state: State<'_, DownloadManager>,
     url: String,
     path: String,
+    request_id: String,
+    worker_count: usize,
 ) -> Result<DownloadResult, String> {
-    let url = validate_podcast_feed_url(&url)?;
-    let download_path = validate_download_directory(&path)?;
-    let tools = resolve_runtime_tools(&app)?;
-    let metadata = read_podcast_metadata(&tools, &url)?;
-    let folder_name = sanitize_podcast_folder_title(metadata.title.as_deref().unwrap_or_default());
-    let podcast_path = create_podcast_directory(&download_path, &folder_name)?;
-    let archive_path = archive_path_for("podcast", &url)?;
+    let manager = state.inner().clone();
+    let active_job = manager.claim_job()?;
+    let task_job = active_job.clone();
+    let task_app = app.clone();
 
-    let mut command = yt_dlp_command(&tools);
-    command
-        .arg("--extract-audio")
-        .arg("--audio-format")
-        .arg("mp3")
-        .arg("--audio-quality")
-        .arg("320K")
-        .arg("--yes-playlist")
-        .arg("--newline")
-        .arg("--download-archive")
-        .arg(&archive_path)
-        .arg("--progress-template")
-        .arg(
-            "download-progress:%(info.playlist_index)s/%(info.playlist_count)s:%(progress._percent_str)s",
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let request_id = validate_request_id(request_id)?;
+        let url = validate_podcast_feed_url(&url)?;
+        let download_path = validate_download_directory(&path)?;
+        let worker_count = validate_worker_count(worker_count)?;
+        let tools = resolve_runtime_tools(&task_app)?;
+        let (job_id, checkpoint_path) =
+            checkpoint_path_for("podcast", &url, &download_path, PODCAST_LAYOUT_VERSION)?;
+        let metadata = match read_playlist_metadata(&tools, &url, &task_job) {
+            Ok(metadata) => metadata,
+            Err(_) if task_job.is_interrupted() => {
+                return finish_interruption(&task_job, &checkpoint_path);
+            }
+            Err(error) => return Err(error),
+        };
+        if task_job.is_interrupted() {
+            return finish_interruption(&task_job, &checkpoint_path);
+        }
+
+        let folder_name =
+            sanitize_podcast_folder_title(metadata.title.as_deref().unwrap_or_default());
+        let podcast_path = create_podcast_directory(&download_path, &folder_name)?;
+        let items = playlist_items(&metadata, false)?;
+        let width = index_width(&items, 4);
+        let success_message = format!(
+            "Finished downloading all available podcast episodes to the “{folder_name}” folder."
+        );
+
+        run_coordinated_download(
+            &task_job,
+            &task_app,
+            "podcast",
+            job_id,
+            &request_id,
+            checkpoint_path,
+            &tools,
+            &podcast_path,
+            items,
+            OutputLayout::Indexed {
+                width,
+                include_uploader: false,
+            },
+            worker_count,
+            success_message,
         )
-        .arg("--paths")
-        .arg(&podcast_path)
-        .arg("--output")
-        .arg("%(playlist_index)04d - %(title)s.%(ext)s")
-        .arg("--")
-        .arg(url.as_str());
-
-    let success_message = format!(
-        "Finished downloading all available podcast episodes to the “{folder_name}” folder."
-    );
-
-    run_monitored_download(
-        &state,
-        &app,
-        "podcast",
-        archive_path,
-        command,
-        success_message,
-    )
-    .await
-}
-
-/// Requests that the active download stop or pause. Both simply terminate the
-/// running `yt-dlp` process (it is not truly suspendable across platforms);
-/// the difference is that stopping also clears saved progress so a future
-/// download starts fresh, while pausing keeps it so Resume can skip
-/// already-completed items via `--download-archive`.
-fn request_download_interruption(
-    state: &DownloadManager,
-    stop: bool,
-) -> Result<DownloadResult, String> {
-    let guard = state.child.lock().unwrap();
-    let Some(child_arc) = guard.as_ref() else {
-        return Err("No download is currently running.".to_string());
-    };
-
-    if stop {
-        state.stop_requested.store(true, Ordering::SeqCst);
-    } else {
-        state.pause_requested.store(true, Ordering::SeqCst);
-    }
-
-    child_arc
-        .lock()
-        .unwrap()
-        .kill()
-        .map_err(|error| format!("Could not stop the download: {error}"))?;
-
-    Ok(DownloadResult {
-        message: if stop {
-            "Stopping the download…".to_string()
-        } else {
-            "Pausing the download…".to_string()
-        },
-        status: "stopping".to_string(),
     })
+    .await;
+
+    manager.release_job(&active_job);
+    result.map_err(|error| format!("The download task ended unexpectedly: {error}"))?
 }
 
 #[command]
-fn stop_download(state: State<'_, DownloadManager>) -> Result<DownloadResult, String> {
-    request_download_interruption(&state, true)
+async fn stop_download(state: State<'_, DownloadManager>) -> Result<DownloadResult, String> {
+    wait_for_interruption(state.inner().clone(), true).await
 }
 
 #[command]
-fn pause_download(state: State<'_, DownloadManager>) -> Result<DownloadResult, String> {
-    request_download_interruption(&state, false)
+async fn pause_download(state: State<'_, DownloadManager>) -> Result<DownloadResult, String> {
+    wait_for_interruption(state.inner().clone(), false).await
 }
 
 fn yt_dlp_command(tools: &RuntimeTools) -> Command {
@@ -883,144 +1013,805 @@ fn yt_dlp_command(tools: &RuntimeTools) -> Command {
     command
 }
 
-/// Runs `yt-dlp` on a dedicated blocking thread (so the UI never freezes),
-/// streams progress events to the frontend, and tracks the child process in
-/// `DownloadManager` so `stop_download`/`pause_download` can interrupt it.
-async fn run_monitored_download(
-    state: &DownloadManager,
-    app: &AppHandle,
-    kind: &'static str,
-    archive_path: PathBuf,
-    mut command: Command,
-    success_message: String,
-) -> Result<DownloadResult, String> {
-    let child_slot = state.child.clone();
-    let stop_flag = state.stop_requested.clone();
-    let pause_flag = state.pause_requested.clone();
-    let progress_app = app.clone();
-
-    tauri::async_runtime::spawn_blocking(move || {
-        stop_flag.store(false, Ordering::SeqCst);
-        pause_flag.store(false, Ordering::SeqCst);
-
-        let mut child = command
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| match error.kind() {
-                std::io::ErrorKind::NotFound => {
-                    "The app's private yt-dlp tool is unavailable. Restart the app and complete setup."
-                        .to_string()
-                }
-                _ => format!("Could not start the app's private yt-dlp tool: {error}"),
-            })?;
-
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "Could not read yt-dlp download progress.".to_string())?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| "Could not read yt-dlp download errors.".to_string())?;
-
-        let progress_kind = kind.to_string();
-        let progress_reader = thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if let Some((current, total, percent)) = parse_download_progress(&line) {
-                    let _ = progress_app.emit(
-                        "download-progress",
-                        DownloadProgress {
-                            current,
-                            total,
-                            percent,
-                            kind: progress_kind.clone(),
-                        },
-                    );
-                }
-            }
-        });
-        let error_reader = thread::spawn(move || {
-            let mut output = String::new();
-            let _ = BufReader::new(stderr).read_to_string(&mut output);
-            output
-        });
-
-        let child_arc = Arc::new(Mutex::new(child));
-        *child_slot.lock().unwrap() = Some(child_arc.clone());
-
-        let status = loop {
-            let wait_result = child_arc.lock().unwrap().try_wait();
-            match wait_result {
-                Ok(Some(status)) => break status,
-                Ok(None) => thread::sleep(Duration::from_millis(150)),
-                Err(error) => {
-                    *child_slot.lock().unwrap() = None;
-                    return Err(format!("Could not wait for yt-dlp to finish: {error}"));
-                }
-            }
-        };
-
-        *child_slot.lock().unwrap() = None;
-        let _ = progress_reader.join();
-        let error_output = error_reader.join().unwrap_or_default();
-
-        let was_stopped = stop_flag.swap(false, Ordering::SeqCst);
-        let was_paused = pause_flag.swap(false, Ordering::SeqCst);
-
-        if was_stopped {
-            let _ = fs::remove_file(&archive_path);
-            return Ok(DownloadResult {
-                message: "Download stopped. Progress for this download was cleared.".to_string(),
-                status: "stopped".to_string(),
-            });
-        }
-
-        if was_paused {
-            return Ok(DownloadResult {
-                message: "Download paused. Resume anytime to continue from where it left off."
+impl DownloadManager {
+    fn claim_job(&self) -> Result<Arc<ActiveDownload>, String> {
+        let (active, _) = &*self.active;
+        let mut guard = active.lock().map_err(|_| {
+            "The download manager is unavailable. Restart the app and try again.".to_string()
+        })?;
+        if guard.is_some() {
+            return Err(
+                "Another download is already running. Pause or stop it before starting a new download."
                     .to_string(),
-                status: "paused".to_string(),
-            });
+            );
         }
 
-        if !status.success() {
-            let details = if error_output.trim().is_empty() {
-                format!("process exited with status {status}")
-            } else {
-                error_output.chars().take(1_000).collect::<String>()
-            };
-            return Err(format!(
-                "yt-dlp stopped before finishing. Check that the source is public, the destination is writable, and ffmpeg is installed for audio conversion: {details}"
-            ));
-        }
+        let job = Arc::new(ActiveDownload {
+            children: Arc::new(Mutex::new(Vec::new())),
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            pause_requested: Arc::new(AtomicBool::new(false)),
+        });
+        *guard = Some(job.clone());
+        Ok(job)
+    }
 
-        let _ = fs::remove_file(&archive_path);
+    fn release_job(&self, job: &Arc<ActiveDownload>) {
+        let (active, finished) = &*self.active;
+        if let Ok(mut guard) = active.lock() {
+            if guard
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, job))
+            {
+                *guard = None;
+                finished.notify_all();
+            }
+        }
+    }
+
+    fn request_interruption(&self, stop: bool) -> Result<Arc<ActiveDownload>, String> {
+        let (active, _) = &*self.active;
+        let job = active
+            .lock()
+            .map_err(|_| {
+                "The download manager is unavailable. Restart the app and try again.".to_string()
+            })?
+            .clone()
+            .ok_or_else(|| "No download is currently running.".to_string())?;
+
+        if stop {
+            job.stop_requested.store(true, Ordering::SeqCst);
+        } else if !job.stop_requested.load(Ordering::SeqCst) {
+            job.pause_requested.store(true, Ordering::SeqCst);
+        }
+        // A worker can have just exited between being listed and signalled.
+        // The coordinator still waits for every worker before resolving pause
+        // or stop, even if a platform reports a transient signalling error.
+        let _ = job.kill_children();
+        Ok(job)
+    }
+
+    fn wait_for_job(&self, job: &Arc<ActiveDownload>) -> Result<(), String> {
+        let (active, finished) = &*self.active;
+        let mut guard = active.lock().map_err(|_| {
+            "The download manager is unavailable. Restart the app and try again.".to_string()
+        })?;
+        while guard
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, job))
+        {
+            guard = finished.wait(guard).map_err(|_| {
+                "The download manager is unavailable. Restart the app and try again.".to_string()
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl ActiveDownload {
+    fn is_interrupted(&self) -> bool {
+        self.stop_requested.load(Ordering::SeqCst) || self.pause_requested.load(Ordering::SeqCst)
+    }
+
+    fn add_child(&self, child: Arc<Mutex<Child>>) {
+        if let Ok(mut children) = self.children.lock() {
+            children.push(child.clone());
+        }
+        if self.is_interrupted() {
+            let _ = child
+                .lock()
+                .ok()
+                .and_then(|mut process| process.kill().ok());
+        }
+    }
+
+    fn remove_child(&self, child: &Arc<Mutex<Child>>) {
+        if let Ok(mut children) = self.children.lock() {
+            children.retain(|current| !Arc::ptr_eq(current, child));
+        }
+    }
+
+    fn kill_children(&self) -> Result<(), String> {
+        let children = self
+            .children
+            .lock()
+            .map_err(|_| "Could not signal the active download workers.".to_string())?
+            .clone();
+        let mut errors = Vec::new();
+        for child in children {
+            match child
+                .lock()
+                .map_err(|_| "Could not signal an active download worker.".to_string())?
+                .kill()
+            {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {}
+                Err(_) => errors.push(()),
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err("Could not signal every active download worker. The download is still waiting for them to exit.".to_string())
+        }
+    }
+}
+
+async fn wait_for_interruption(
+    manager: DownloadManager,
+    stop: bool,
+) -> Result<DownloadResult, String> {
+    let job = manager.request_interruption(stop)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        manager.wait_for_job(&job)?;
+        let stopped = job.stop_requested.load(Ordering::SeqCst);
         Ok(DownloadResult {
-            message: success_message,
-            status: "completed".to_string(),
+            message: if stopped {
+                "Download stopped. Progress for this download was cleared.".to_string()
+            } else {
+                "Download paused. Resume anytime to continue from where it left off.".to_string()
+            },
+            status: if stopped { "stopped" } else { "paused" }.to_string(),
         })
     })
     .await
-    .map_err(|error| format!("The download task ended unexpectedly: {error}"))?
+    .map_err(|error| format!("The interruption task ended unexpectedly: {error}"))?
 }
 
-/// Derives a stable, per-source path for `yt-dlp`'s `--download-archive`
-/// file so pausing and resuming the same URL skips already-downloaded items.
-fn archive_path_for(kind: &str, url: &Url) -> Result<PathBuf, String> {
-    let mut hasher = DefaultHasher::new();
-    url.as_str().hash(&mut hasher);
-    let hash = hasher.finish();
+#[derive(Clone)]
+enum OutputLayout {
+    Single,
+    Indexed {
+        width: usize,
+        include_uploader: bool,
+    },
+}
 
+fn run_coordinated_download(
+    active_job: &Arc<ActiveDownload>,
+    app: &AppHandle,
+    kind: &'static str,
+    job_id: String,
+    request_id: &str,
+    checkpoint_path: PathBuf,
+    tools: &RuntimeTools,
+    download_path: &Path,
+    items: Vec<DownloadItem>,
+    output_layout: OutputLayout,
+    worker_count: usize,
+    success_message: String,
+) -> Result<DownloadResult, String> {
+    run_coordinated_download_with_worker(
+        active_job,
+        &job_id,
+        &checkpoint_path,
+        tools,
+        download_path,
+        items,
+        output_layout,
+        &success_message,
+        worker_count,
+        Arc::new(YtDlpDownloadWorker),
+        |aggregate| aggregate.emit(app, &job_id, request_id, kind),
+    )
+}
+
+fn run_coordinated_download_with_worker<W, F>(
+    active_job: &Arc<ActiveDownload>,
+    job_id: &str,
+    checkpoint_path: &Path,
+    tools: &RuntimeTools,
+    download_path: &Path,
+    items: Vec<DownloadItem>,
+    output_layout: OutputLayout,
+    success_message: &str,
+    worker_count: usize,
+    worker: Arc<W>,
+    emit_progress: F,
+) -> Result<DownloadResult, String>
+where
+    W: DownloadWorker + 'static,
+    F: Fn(&AggregateProgress),
+{
+    let mut checkpoint = read_checkpoint(checkpoint_path, job_id)?;
+    let pending = pending_items(&items, &checkpoint.completed);
+    let completed = completed_item_count(&items, &checkpoint.completed);
+    let mut aggregate = AggregateProgress::new(completed, items.len());
+    emit_progress(&aggregate);
+
+    if active_job.is_interrupted() {
+        return finish_interruption(active_job, checkpoint_path);
+    }
+
+    let queue = Arc::new(Mutex::new(VecDeque::from(pending)));
+    let (sender, receiver) = mpsc::channel();
+    let worker_count = validate_worker_count(worker_count)?.min(
+        queue
+            .lock()
+            .map_err(|_| "Could not prepare the download queue.".to_string())?
+            .len(),
+    );
+    let mut workers = Vec::with_capacity(worker_count);
+
+    for _ in 0..worker_count {
+        let worker_queue = queue.clone();
+        let worker_sender = sender.clone();
+        let worker_job = active_job.clone();
+        let worker_tools = tools.clone();
+        let worker_path = download_path.to_path_buf();
+        let worker_layout = output_layout.clone();
+        let worker_runner = worker.clone();
+        workers.push(thread::spawn(move || loop {
+            if worker_job.is_interrupted() {
+                break;
+            }
+            let item = match worker_queue.lock() {
+                Ok(mut queue) => queue.pop_front(),
+                Err(_) => None,
+            };
+            let Some(item) = item else {
+                break;
+            };
+
+            if worker_sender
+                .send(WorkerEvent::Started(item.clone()))
+                .is_err()
+            {
+                break;
+            }
+            let result = worker_runner.run(
+                &worker_job,
+                &worker_tools,
+                &worker_path,
+                &worker_layout,
+                &item,
+                &worker_sender,
+            );
+            if worker_sender
+                .send(WorkerEvent::Finished { item, result })
+                .is_err()
+            {
+                break;
+            }
+        }));
+    }
+    drop(sender);
+
+    let mut failures = Vec::new();
+    while let Ok(event) = receiver.recv() {
+        match event {
+            WorkerEvent::Started(item) => {
+                aggregate.start(&item);
+                emit_progress(&aggregate);
+            }
+            WorkerEvent::Progress {
+                checkpoint_key,
+                percent,
+            } => {
+                aggregate.update(&checkpoint_key, percent);
+                emit_progress(&aggregate);
+            }
+            WorkerEvent::Finished { item, result } => {
+                match result {
+                    WorkerResult::Completed => {
+                        if checkpoint.completed.insert(item.checkpoint_key.clone()) {
+                            if let Err(error) = write_checkpoint(checkpoint_path, &checkpoint) {
+                                checkpoint.completed.remove(&item.checkpoint_key);
+                                failures.push(format!(
+                                    "item {} could not save its resume checkpoint ({error})",
+                                    item.source_index
+                                ));
+                            }
+                        }
+                    }
+                    WorkerResult::Interrupted => {}
+                    WorkerResult::Failed(error) => {
+                        failures.push(format!("item {}: {error}", item.source_index));
+                    }
+                }
+                let completed = completed_item_count(&items, &checkpoint.completed);
+                aggregate.finish(&item.checkpoint_key, completed);
+                emit_progress(&aggregate);
+            }
+        }
+    }
+
+    for worker in workers {
+        if worker.join().is_err() {
+            failures.push("a download worker ended unexpectedly".to_string());
+        }
+    }
+
+    if active_job.is_interrupted() {
+        return finish_interruption(active_job, checkpoint_path);
+    }
+
+    if !failures.is_empty() {
+        let details = failures
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!(
+            "{} item(s) could not be downloaded after the other workers finished. {} of {} item(s) were checkpointed and will be skipped if you choose Download again. Check that the source is public and the destination is writable. Details: {}",
+            failures.len(),
+            completed_item_count(&items, &checkpoint.completed),
+            items.len(),
+            details
+        ));
+    }
+
+    clear_checkpoint(checkpoint_path)?;
+    Ok(DownloadResult {
+        message: success_message.to_string(),
+        status: "completed".to_string(),
+    })
+}
+
+fn run_download_worker(
+    active_job: &Arc<ActiveDownload>,
+    tools: &RuntimeTools,
+    download_path: &Path,
+    output_layout: &OutputLayout,
+    item: &DownloadItem,
+    sender: &mpsc::Sender<WorkerEvent>,
+) -> WorkerResult {
+    if active_job.is_interrupted() {
+        return WorkerResult::Interrupted;
+    }
+
+    let mut command = yt_dlp_command(tools);
+    command
+        .arg("--extract-audio")
+        .arg("--audio-format")
+        .arg("mp3")
+        .arg("--audio-quality")
+        .arg("320K")
+        .arg("--newline")
+        .arg("--no-playlist")
+        .arg("--paths")
+        .arg(download_path)
+        .arg("--output")
+        .arg(output_template(output_layout, item))
+        .arg("--progress-template")
+        .arg("worker-progress:%(progress._percent_str)s")
+        .arg("--")
+        .arg(&item.locator);
+
+    let mut child = match command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            return WorkerResult::Failed(match error.kind() {
+                std::io::ErrorKind::NotFound => {
+                    "the app's private yt-dlp tool is unavailable".to_string()
+                }
+                _ => "the app could not start its private yt-dlp tool".to_string(),
+            });
+        }
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return WorkerResult::Failed("could not read yt-dlp progress output".to_string());
+    };
+    let Some(stderr) = child.stderr.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return WorkerResult::Failed("could not read yt-dlp error output".to_string());
+    };
+
+    let child = Arc::new(Mutex::new(child));
+    active_job.add_child(child.clone());
+    let progress_sender = sender.clone();
+    let checkpoint_key = item.checkpoint_key.clone();
+    let progress_reader = thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some(percent) = parse_worker_progress(&line) {
+                let _ = progress_sender.send(WorkerEvent::Progress {
+                    checkpoint_key: checkpoint_key.clone(),
+                    percent,
+                });
+            }
+        }
+    });
+    let error_reader = thread::spawn(move || {
+        let mut output = String::new();
+        let _ = BufReader::new(stderr).read_to_string(&mut output);
+    });
+
+    let status = wait_for_child(&child);
+    active_job.remove_child(&child);
+    let _ = progress_reader.join();
+    let _ = error_reader.join();
+
+    if active_job.is_interrupted() {
+        return WorkerResult::Interrupted;
+    }
+    match status {
+        Ok(status) if status.success() => WorkerResult::Completed,
+        Ok(status) => WorkerResult::Failed(format!("yt-dlp exited with status {status}")),
+        Err(error) => WorkerResult::Failed(error),
+    }
+}
+
+fn wait_for_child(child: &Arc<Mutex<Child>>) -> Result<std::process::ExitStatus, String> {
+    loop {
+        let status = child
+            .lock()
+            .map_err(|_| "Could not wait for a yt-dlp worker.".to_string())?
+            .try_wait()
+            .map_err(|_| "Could not wait for a yt-dlp worker.".to_string())?;
+        if let Some(status) = status {
+            return Ok(status);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn output_template(layout: &OutputLayout, item: &DownloadItem) -> String {
+    match layout {
+        OutputLayout::Single => "%(uploader)s/%(title)s.%(ext)s".to_string(),
+        OutputLayout::Indexed {
+            width,
+            include_uploader,
+        } => {
+            let prefix = format!("{:0width$}", item.source_index, width = *width);
+            if *include_uploader {
+                format!("%(uploader)s/{prefix} - %(title)s.%(ext)s")
+            } else {
+                format!("{prefix} - %(title)s.%(ext)s")
+            }
+        }
+    }
+}
+
+fn finish_interruption(
+    active_job: &ActiveDownload,
+    checkpoint_path: &Path,
+) -> Result<DownloadResult, String> {
+    if active_job.stop_requested.load(Ordering::SeqCst) {
+        clear_checkpoint(checkpoint_path)?;
+        Ok(DownloadResult {
+            message: "Download stopped. Progress for this download was cleared.".to_string(),
+            status: "stopped".to_string(),
+        })
+    } else {
+        Ok(DownloadResult {
+            message: "Download paused. Resume anytime to continue from where it left off."
+                .to_string(),
+            status: "paused".to_string(),
+        })
+    }
+}
+
+fn pending_items(items: &[DownloadItem], completed: &BTreeSet<String>) -> Vec<DownloadItem> {
+    items
+        .iter()
+        .filter(|item| !completed.contains(&item.checkpoint_key))
+        .cloned()
+        .collect()
+}
+
+fn completed_item_count(items: &[DownloadItem], completed: &BTreeSet<String>) -> usize {
+    items
+        .iter()
+        .filter(|item| completed.contains(&item.checkpoint_key))
+        .count()
+}
+
+impl AggregateProgress {
+    fn new(completed: usize, total: usize) -> Self {
+        Self {
+            completed: completed.min(total),
+            total,
+            active: BTreeMap::new(),
+        }
+    }
+
+    fn start(&mut self, item: &DownloadItem) {
+        self.active
+            .insert(item.checkpoint_key.clone(), (item.source_index, None));
+    }
+
+    fn update(&mut self, checkpoint_key: &str, percent: String) {
+        if let Some((_, active_percent)) = self.active.get_mut(checkpoint_key) {
+            *active_percent = Some(percent);
+        }
+    }
+
+    fn finish(&mut self, checkpoint_key: &str, completed: usize) {
+        self.active.remove(checkpoint_key);
+        self.completed = self.completed.max(completed.min(self.total));
+    }
+
+    fn emit(&self, app: &AppHandle, job_id: &str, request_id: &str, kind: &str) {
+        let active = self.active.values().next();
+        let _ = app.emit(
+            "download-progress",
+            DownloadProgress {
+                job_id: job_id.to_string(),
+                request_id: request_id.to_string(),
+                completed: self.completed,
+                total: self.total,
+                active: self.active.len(),
+                active_item: active.map(|(item, _)| *item),
+                percent: active.and_then(|(_, percent)| percent.clone()),
+                kind: kind.to_string(),
+            },
+        );
+    }
+}
+
+fn checkpoint_path_for(
+    kind: &str,
+    url: &Url,
+    destination: &Path,
+    layout_version: &str,
+) -> Result<(String, PathBuf), String> {
+    let job_id = checkpoint_identity(kind, url, destination, layout_version)?;
     let base = dirs::cache_dir()
         .or_else(dirs::home_dir)
         .ok_or_else(|| "Could not determine a location to track download progress.".to_string())?
         .join("yt-dlp-tauri")
-        .join("archives");
+        .join("checkpoints");
     fs::create_dir_all(&base)
         .map_err(|error| format!("Could not prepare download progress tracking: {error}"))?;
 
-    Ok(base.join(format!("{kind}-{hash:x}.txt")))
+    Ok((job_id.clone(), base.join(format!("{kind}-{job_id}.json"))))
+}
+
+fn checkpoint_identity(
+    kind: &str,
+    url: &Url,
+    destination: &Path,
+    layout_version: &str,
+) -> Result<String, String> {
+    let destination = path_to_string(destination)?;
+    let normalized_url = normalized_source_url(url);
+    let mut hasher = Sha256::new();
+    for value in [
+        "yt-dlp-tauri-checkpoint",
+        kind,
+        layout_version,
+        normalized_url.as_str(),
+        destination.as_str(),
+    ] {
+        hasher.update(value.as_bytes());
+        hasher.update([0]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn normalized_source_url(url: &Url) -> String {
+    let mut normalized = url.clone();
+    normalized.set_fragment(None);
+    let remove_port = matches!(
+        (normalized.scheme(), normalized.port()),
+        ("http", Some(80)) | ("https", Some(443))
+    );
+    if remove_port {
+        let _ = normalized.set_port(None);
+    }
+    normalized.to_string()
+}
+
+fn read_checkpoint(path: &Path, job_id: &str) -> Result<DownloadCheckpoint, String> {
+    match fs::read(path) {
+        Ok(contents) => {
+            let checkpoint: DownloadCheckpoint =
+                serde_json::from_slice(&contents).map_err(|_| {
+                    "Saved download progress is invalid. Stop this download and try again."
+                        .to_string()
+                })?;
+            if checkpoint.schema_version != CHECKPOINT_SCHEMA_VERSION || checkpoint.job_id != job_id
+            {
+                return Err(
+                    "Saved download progress is incompatible with this download. Stop this download and try again."
+                        .to_string(),
+                );
+            }
+            Ok(checkpoint)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(DownloadCheckpoint {
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
+            job_id: job_id.to_string(),
+            completed: BTreeSet::new(),
+        }),
+        Err(error) => Err(format!("Could not read saved download progress: {error}")),
+    }
+}
+
+fn write_checkpoint(path: &Path, checkpoint: &DownloadCheckpoint) -> Result<(), String> {
+    let contents = serde_json::to_vec(checkpoint)
+        .map_err(|error| format!("Could not prepare saved download progress: {error}"))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Could not prepare saved download progress.".to_string())?;
+    let mut temporary_path = None;
+    for attempt in 0..10 {
+        let candidate = parent.join(format!(
+            ".checkpoint-{}-{}-{attempt}.tmp",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default()
+        ));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                let write_result = file.write_all(&contents).and_then(|()| file.sync_all());
+                drop(file);
+                if let Err(error) = write_result {
+                    let _ = fs::remove_file(&candidate);
+                    return Err(format!("Could not save download progress: {error}"));
+                }
+                temporary_path = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("Could not save download progress: {error}")),
+        }
+    }
+    let temporary_path =
+        temporary_path.ok_or_else(|| "Could not create saved download progress.".to_string())?;
+    if let Err(error) = fs::rename(&temporary_path, path) {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(format!("Could not save download progress: {error}"));
+    }
+    sync_checkpoint_directory(parent)
+}
+
+#[cfg(unix)]
+fn sync_checkpoint_directory(path: &Path) -> Result<(), String> {
+    fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("Could not finish saving download progress: {error}"))
+}
+
+#[cfg(not(unix))]
+fn sync_checkpoint_directory(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+fn clear_checkpoint(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("Could not clear saved download progress: {error}")),
+    }
+}
+
+fn load_or_create_download_settings(
+    path: &Path,
+    default_download_path: &Path,
+) -> Result<DownloadSettings, String> {
+    match fs::read_to_string(path) {
+        Ok(contents) => {
+            let contents = contents.trim();
+            if contents.is_empty() {
+                return Err(
+                    "The saved download destination is empty. Choose an existing folder."
+                        .to_string(),
+                );
+            }
+
+            if contents.starts_with('{') {
+                let settings: DownloadSettings = serde_json::from_str(contents).map_err(|_| {
+                    "Saved download settings are invalid. Choose a folder to save new settings."
+                        .to_string()
+                })?;
+                if settings.schema_version != SETTINGS_SCHEMA_VERSION {
+                    return Err(
+                        "Saved download settings use an unsupported version. Choose a folder to save new settings."
+                            .to_string(),
+                    );
+                }
+
+                return download_settings_from_input(DownloadSettingsInput {
+                    download_path: settings.download_path,
+                    worker_count: settings.worker_count,
+                });
+            }
+
+            // Before versioned settings, this file only held a destination path.
+            // Validate it first and only replace it after the new JSON is complete.
+            let settings = download_settings_from_input(DownloadSettingsInput {
+                download_path: contents.to_string(),
+                worker_count: DEFAULT_WORKER_COUNT,
+            })?;
+            write_download_settings(path, &settings)?;
+            Ok(settings)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(default_download_path).map_err(|error| {
+                format!("Could not create the default download destination: {error}")
+            })?;
+            let settings = download_settings_from_input(DownloadSettingsInput {
+                download_path: path_to_string(default_download_path)?,
+                worker_count: DEFAULT_WORKER_COUNT,
+            })?;
+            write_download_settings(path, &settings)?;
+            Ok(settings)
+        }
+        Err(error) => Err(format!("Could not read saved download settings: {error}")),
+    }
+}
+
+fn download_settings_from_input(input: DownloadSettingsInput) -> Result<DownloadSettings, String> {
+    let download_path = validate_download_directory(&input.download_path)?;
+    let worker_count = validate_worker_count(input.worker_count)?;
+
+    Ok(DownloadSettings {
+        schema_version: SETTINGS_SCHEMA_VERSION,
+        download_path: path_to_string(&download_path)?,
+        worker_count,
+    })
+}
+
+fn write_download_settings(path: &Path, settings: &DownloadSettings) -> Result<(), String> {
+    let contents = serde_json::to_vec(settings)
+        .map_err(|error| format!("Could not prepare download settings: {error}"))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Could not prepare download settings.".to_string())?;
+    let mut temporary_path = None;
+
+    for attempt in 0..10 {
+        let candidate = parent.join(format!(
+            ".yt-dlp-tauri-settings-{}-{}-{attempt}.tmp",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default()
+        ));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                let write_result = file.write_all(&contents).and_then(|()| file.sync_all());
+                drop(file);
+                if let Err(error) = write_result {
+                    let _ = fs::remove_file(&candidate);
+                    return Err(format!("Could not save download settings: {error}"));
+                }
+                temporary_path = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("Could not save download settings: {error}")),
+        }
+    }
+
+    let temporary_path =
+        temporary_path.ok_or_else(|| "Could not create saved download settings.".to_string())?;
+    if let Err(error) = fs::rename(&temporary_path, path) {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(format!("Could not save download settings: {error}"));
+    }
+    sync_settings_directory(parent)
+}
+
+#[cfg(unix)]
+fn sync_settings_directory(path: &Path) -> Result<(), String> {
+    fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("Could not finish saving download settings: {error}"))
+}
+
+#[cfg(not(unix))]
+fn sync_settings_directory(_path: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 fn settings_path() -> Result<PathBuf, String> {
@@ -1035,6 +1826,16 @@ fn default_download_directory() -> Result<PathBuf, String> {
         .ok_or_else(|| {
             "Could not determine a default download destination. Choose a folder.".to_string()
         })
+}
+
+fn validate_worker_count(value: usize) -> Result<usize, String> {
+    if !(MIN_WORKER_COUNT..=MAX_WORKER_COUNT).contains(&value) {
+        return Err(format!(
+            "Choose between {MIN_WORKER_COUNT} and {MAX_WORKER_COUNT} concurrent workers."
+        ));
+    }
+
+    Ok(value)
 }
 
 fn validate_download_directory(value: &str) -> Result<PathBuf, String> {
@@ -1121,52 +1922,189 @@ fn validate_podcast_feed_url(value: &str) -> Result<Url, String> {
     Ok(url)
 }
 
-fn read_podcast_metadata(
+fn validate_request_id(value: String) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err("Could not start the download. Please try again.".to_string());
+    }
+    Ok(value.to_string())
+}
+
+/// Enumerates every source item before workers begin. The resulting locators
+/// are passed one at a time to `yt-dlp --no-playlist`, which avoids concurrent
+/// playlist processing and makes the coordinator the sole checkpoint writer.
+fn read_playlist_metadata(
     tools: &RuntimeTools,
     url: &Url,
-) -> Result<PodcastPlaylistMetadata, String> {
-    let output = yt_dlp_command(tools)
+    active_job: &Arc<ActiveDownload>,
+) -> Result<PlaylistMetadata, String> {
+    let mut command = yt_dlp_command(tools);
+    command
         .arg("--simulate")
         .arg("--flat-playlist")
-        .arg("--playlist-end")
-        .arg("1")
         .arg("--dump-single-json")
         .arg("--no-warnings")
         .arg("--quiet")
         .arg("--")
-        .arg(url.as_str())
-        .output()
-        .map_err(|error| match error.kind() {
-            std::io::ErrorKind::NotFound => {
-                "The app's private yt-dlp tool is unavailable. Restart the app and complete setup."
-                    .to_string()
-            }
-            _ => format!(
-                "Could not start the app's private yt-dlp tool to inspect the podcast feed: {error}"
-            ),
-        })?;
+        .arg(url.as_str());
+    let output = run_tracked_capture(command, active_job)?;
 
     if !output.status.success() {
         return Err(
-            "yt-dlp could not read this podcast feed. Confirm that the URL is a public RSS feed supported by yt-dlp."
+            "yt-dlp could not read this source. Confirm that it is public and supported by yt-dlp."
                 .to_string(),
         );
     }
 
-    let metadata: PodcastPlaylistMetadata = serde_json::from_slice(&output.stdout).map_err(|_| {
-        "yt-dlp did not return valid podcast feed information. Confirm that the URL is an RSS feed."
+    let metadata: PlaylistMetadata = serde_json::from_slice(&output.stdout).map_err(|_| {
+        "yt-dlp did not return valid playlist information. Confirm that the selected URL is a playlist or public RSS feed."
             .to_string()
     })?;
     if metadata.item_type.as_deref() != Some("playlist")
         || metadata.entries.as_ref().is_none_or(Vec::is_empty)
     {
         return Err(
-            "This RSS feed has no downloadable podcast episodes. Choose a feed with at least one episode."
+            "This source has no downloadable items. Choose a playlist or podcast feed with at least one item."
                 .to_string(),
         );
     }
 
     Ok(metadata)
+}
+
+struct CapturedProcess {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+}
+
+fn run_tracked_capture(
+    mut command: Command,
+    active_job: &Arc<ActiveDownload>,
+) -> Result<CapturedProcess, String> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => {
+                "The app's private yt-dlp tool is unavailable. Restart the app and complete setup."
+                    .to_string()
+            }
+            _ => {
+                "Could not start the app's private yt-dlp tool to inspect this source.".to_string()
+            }
+        })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Could not read yt-dlp source information.".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Could not read yt-dlp source information.".to_string())?;
+    let child = Arc::new(Mutex::new(child));
+    active_job.add_child(child.clone());
+    let stdout_reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        let _ = BufReader::new(stdout).read_to_end(&mut output);
+        output
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut output = String::new();
+        let _ = BufReader::new(stderr).read_to_string(&mut output);
+    });
+    let status = wait_for_child(&child);
+    active_job.remove_child(&child);
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let _ = stderr_reader.join();
+
+    if active_job.is_interrupted() {
+        return Err("The download was interrupted.".to_string());
+    }
+    Ok(CapturedProcess {
+        status: status?,
+        stdout,
+    })
+}
+
+fn playlist_items(
+    metadata: &PlaylistMetadata,
+    is_youtube_playlist: bool,
+) -> Result<Vec<DownloadItem>, String> {
+    let entries = metadata.entries.as_ref().ok_or_else(|| {
+        "This source has no downloadable items. Choose a playlist or podcast feed with at least one item."
+            .to_string()
+    })?;
+    let mut used_keys = BTreeSet::new();
+    let mut items = Vec::with_capacity(entries.len());
+
+    for (position, entry) in entries.iter().enumerate() {
+        let source_index = position + 1;
+        let locator = item_locator(entry, is_youtube_playlist).ok_or_else(|| {
+            format!(
+                "yt-dlp could not find a safe, downloadable locator for item {source_index}. Try the source again or choose another feed."
+            )
+        })?;
+        let identity = entry
+            .id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or(locator.as_str());
+        let mut checkpoint_key = format!("item:{identity}");
+        if !used_keys.insert(checkpoint_key.clone()) {
+            checkpoint_key = format!("{checkpoint_key}#{source_index}");
+            used_keys.insert(checkpoint_key.clone());
+        }
+        items.push(DownloadItem {
+            checkpoint_key,
+            locator,
+            source_index,
+        });
+    }
+
+    if items.is_empty() {
+        return Err(
+            "This source has no downloadable items. Choose a playlist or podcast feed with at least one item."
+                .to_string(),
+        );
+    }
+    Ok(items)
+}
+
+fn item_locator(entry: &PlaylistEntry, is_youtube_playlist: bool) -> Option<String> {
+    let candidates = if is_youtube_playlist {
+        [&entry.webpage_url, &entry.original_url, &entry.url]
+    } else {
+        [&entry.url, &entry.webpage_url, &entry.original_url]
+    };
+    for candidate in candidates.into_iter().flatten() {
+        if is_http_url(candidate) {
+            return Some(candidate.to_string());
+        }
+    }
+
+    if is_youtube_playlist {
+        let candidate = entry.id.as_deref().or(entry.url.as_deref())?;
+        let mut locator = Url::parse("https://www.youtube.com/watch").ok()?;
+        locator.query_pairs_mut().append_pair("v", candidate);
+        return Some(locator.to_string());
+    }
+    None
+}
+
+fn is_http_url(value: &str) -> bool {
+    Url::parse(value)
+        .ok()
+        .is_some_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
+}
+
+fn index_width(items: &[DownloadItem], minimum: usize) -> usize {
+    items.len().max(1).to_string().len().max(minimum)
 }
 
 fn create_podcast_directory(download_path: &Path, folder_name: &str) -> Result<PathBuf, String> {
@@ -1232,6 +2170,7 @@ fn sanitize_podcast_folder_title(title: &str) -> String {
     folder_name
 }
 
+#[cfg(test)]
 fn parse_download_progress(line: &str) -> Option<(usize, usize, String)> {
     let progress = line.strip_prefix("download-progress:")?;
     let (item, percent) = progress.split_once(':')?;
@@ -1240,6 +2179,12 @@ fn parse_download_progress(line: &str) -> Option<(usize, usize, String)> {
     let total = total.trim().parse().ok()?;
 
     Some((current, total, percent.trim().chars().take(12).collect()))
+}
+
+fn parse_worker_progress(line: &str) -> Option<String> {
+    line.strip_prefix("worker-progress:")
+        .map(|percent| percent.trim().chars().take(12).collect())
+        .filter(|percent: &String| !percent.is_empty())
 }
 
 fn path_to_string(path: &Path) -> Result<String, String> {
@@ -1253,11 +2198,12 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .manage(DownloadManager::default())
         .manage(RuntimeSetupManager::default())
+        .manage(SettingsManager::default())
         .invoke_handler(tauri::generate_handler![
             get_runtime_setup_status,
             setup_runtime_dependencies,
-            save_download_path,
-            get_download_path,
+            save_download_settings,
+            get_download_settings,
             download_audio,
             download_podcast,
             stop_download,
@@ -1270,9 +2216,318 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_download_progress, runtime_assets_for, sanitize_podcast_folder_title,
-        validate_podcast_feed_url, validate_youtube_url,
+        checkpoint_identity, download_settings_from_input, index_width,
+        load_or_create_download_settings, output_template, parse_download_progress, pending_items,
+        playlist_items, read_checkpoint, run_coordinated_download_with_worker, runtime_assets_for,
+        sanitize_podcast_folder_title, validate_podcast_feed_url, validate_worker_count,
+        validate_youtube_url, write_checkpoint, ActiveDownload, AggregateProgress,
+        DownloadCheckpoint, DownloadItem, DownloadManager, DownloadSettings, DownloadSettingsInput,
+        DownloadWorker, OutputLayout, PlaylistEntry, PlaylistMetadata, RuntimeTools, WorkerEvent,
+        WorkerResult, CHECKPOINT_SCHEMA_VERSION, DEFAULT_WORKER_COUNT, SETTINGS_SCHEMA_VERSION,
     };
+    use std::{
+        collections::BTreeSet,
+        fs,
+        path::{Path, PathBuf},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            mpsc, Arc, Condvar, Mutex,
+        },
+        thread,
+        time::Duration,
+    };
+    use url::Url;
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+    const TEST_WORKER_COUNT: usize = 3;
+    static TEST_DIRECTORY_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    struct TestDirectory {
+        path: PathBuf,
+    }
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "ytdownloader-coordinator-test-{}-{}",
+                std::process::id(),
+                TEST_DIRECTORY_COUNTER.fetch_add(1, Ordering::SeqCst)
+            ));
+            fs::create_dir(&path).expect("create isolated test directory");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn test_items(count: usize) -> Vec<DownloadItem> {
+        (1..=count)
+            .map(|source_index| DownloadItem {
+                checkpoint_key: format!("item:{source_index}"),
+                locator: format!("https://example.test/{source_index}"),
+                source_index,
+            })
+            .collect()
+    }
+
+    fn test_runtime_tools() -> RuntimeTools {
+        RuntimeTools {
+            directory: PathBuf::from("test-runtime"),
+            yt_dlp: PathBuf::from("test-runtime/yt-dlp"),
+            ffmpeg: PathBuf::from("test-runtime/ffmpeg"),
+            ffprobe: PathBuf::from("test-runtime/ffprobe"),
+        }
+    }
+
+    #[derive(Default)]
+    struct ConcurrentWorkerSnapshot {
+        active: usize,
+        max_active: usize,
+        started: Vec<usize>,
+        release: bool,
+    }
+
+    #[derive(Default)]
+    struct ConcurrentWorkerState {
+        snapshot: Mutex<ConcurrentWorkerSnapshot>,
+        changed: Condvar,
+    }
+
+    impl ConcurrentWorkerState {
+        fn wait_for_started(&self, expected: usize) {
+            let snapshot = self.snapshot.lock().expect("lock concurrent worker state");
+            let (snapshot, timeout) = self
+                .changed
+                .wait_timeout_while(snapshot, TEST_TIMEOUT, |snapshot| {
+                    snapshot.started.len() < expected
+                })
+                .expect("wait for concurrent workers");
+            assert!(
+                !timeout.timed_out(),
+                "only {} of {expected} workers started",
+                snapshot.started.len()
+            );
+        }
+
+        fn release(&self) {
+            let mut snapshot = self.snapshot.lock().expect("lock concurrent worker state");
+            snapshot.release = true;
+            self.changed.notify_all();
+        }
+
+        fn snapshot(&self) -> (usize, Vec<usize>) {
+            let snapshot = self.snapshot.lock().expect("lock concurrent worker state");
+            (snapshot.max_active, snapshot.started.clone())
+        }
+    }
+
+    struct ConcurrentWorker {
+        state: Arc<ConcurrentWorkerState>,
+    }
+
+    impl DownloadWorker for ConcurrentWorker {
+        fn run(
+            &self,
+            _active_job: &Arc<ActiveDownload>,
+            _tools: &RuntimeTools,
+            _download_path: &Path,
+            _output_layout: &OutputLayout,
+            item: &DownloadItem,
+            sender: &mpsc::Sender<WorkerEvent>,
+        ) -> WorkerResult {
+            {
+                let mut snapshot = self
+                    .state
+                    .snapshot
+                    .lock()
+                    .expect("lock concurrent worker state");
+                snapshot.active += 1;
+                snapshot.max_active = snapshot.max_active.max(snapshot.active);
+                snapshot.started.push(item.source_index);
+                self.state.changed.notify_all();
+            }
+            let _ = sender.send(WorkerEvent::Progress {
+                checkpoint_key: item.checkpoint_key.clone(),
+                percent: "50.0%".to_string(),
+            });
+
+            let mut snapshot = self
+                .state
+                .snapshot
+                .lock()
+                .expect("lock concurrent worker state");
+            while !snapshot.release {
+                snapshot = self
+                    .state
+                    .changed
+                    .wait(snapshot)
+                    .expect("wait for concurrent worker release");
+            }
+            snapshot.active -= 1;
+            self.state.changed.notify_all();
+            WorkerResult::Completed
+        }
+    }
+
+    struct ScriptedWorker {
+        failed_key: String,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl DownloadWorker for ScriptedWorker {
+        fn run(
+            &self,
+            _active_job: &Arc<ActiveDownload>,
+            _tools: &RuntimeTools,
+            _download_path: &Path,
+            _output_layout: &OutputLayout,
+            item: &DownloadItem,
+            sender: &mpsc::Sender<WorkerEvent>,
+        ) -> WorkerResult {
+            self.calls
+                .lock()
+                .expect("record scripted worker call")
+                .push(item.checkpoint_key.clone());
+            let _ = sender.send(WorkerEvent::Progress {
+                checkpoint_key: item.checkpoint_key.clone(),
+                percent: "25.0%".to_string(),
+            });
+
+            if item.checkpoint_key == self.failed_key {
+                WorkerResult::Failed("simulated yt-dlp failure".to_string())
+            } else {
+                WorkerResult::Completed
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct InterruptionWorkerSnapshot {
+        started: usize,
+        observed_interruption: usize,
+        permit_interruption_check: bool,
+        release: bool,
+    }
+
+    #[derive(Default)]
+    struct InterruptionWorkerState {
+        snapshot: Mutex<InterruptionWorkerSnapshot>,
+        changed: Condvar,
+    }
+
+    impl InterruptionWorkerState {
+        fn wait_for_started(&self, expected: usize) {
+            let snapshot = self
+                .snapshot
+                .lock()
+                .expect("lock interruption worker state");
+            let (snapshot, timeout) = self
+                .changed
+                .wait_timeout_while(snapshot, TEST_TIMEOUT, |snapshot| {
+                    snapshot.started < expected
+                })
+                .expect("wait for interruption workers");
+            assert!(
+                !timeout.timed_out(),
+                "only {} of {expected} workers started",
+                snapshot.started
+            );
+        }
+
+        fn permit_interruption_check(&self) {
+            let mut snapshot = self
+                .snapshot
+                .lock()
+                .expect("lock interruption worker state");
+            snapshot.permit_interruption_check = true;
+            self.changed.notify_all();
+        }
+
+        fn wait_for_observed_interruption(&self, expected: usize) {
+            let snapshot = self
+                .snapshot
+                .lock()
+                .expect("lock interruption worker state");
+            let (snapshot, timeout) = self
+                .changed
+                .wait_timeout_while(snapshot, TEST_TIMEOUT, |snapshot| {
+                    snapshot.observed_interruption < expected
+                })
+                .expect("wait for worker interruption observations");
+            assert!(
+                !timeout.timed_out(),
+                "only {} of {expected} workers observed the interruption",
+                snapshot.observed_interruption
+            );
+        }
+
+        fn release(&self) {
+            let mut snapshot = self
+                .snapshot
+                .lock()
+                .expect("lock interruption worker state");
+            snapshot.release = true;
+            self.changed.notify_all();
+        }
+    }
+
+    struct InterruptibleWorker {
+        state: Arc<InterruptionWorkerState>,
+    }
+
+    impl DownloadWorker for InterruptibleWorker {
+        fn run(
+            &self,
+            active_job: &Arc<ActiveDownload>,
+            _tools: &RuntimeTools,
+            _download_path: &Path,
+            _output_layout: &OutputLayout,
+            _item: &DownloadItem,
+            _sender: &mpsc::Sender<WorkerEvent>,
+        ) -> WorkerResult {
+            let mut snapshot = self
+                .state
+                .snapshot
+                .lock()
+                .expect("lock interruption worker state");
+            snapshot.started += 1;
+            self.state.changed.notify_all();
+            while !snapshot.permit_interruption_check {
+                snapshot = self
+                    .state
+                    .changed
+                    .wait(snapshot)
+                    .expect("wait to check interruption");
+            }
+
+            let interrupted = active_job.is_interrupted();
+            if interrupted {
+                snapshot.observed_interruption += 1;
+                self.state.changed.notify_all();
+            }
+            while !snapshot.release {
+                snapshot = self
+                    .state
+                    .changed
+                    .wait(snapshot)
+                    .expect("wait for interruption worker release");
+            }
+
+            if interrupted {
+                WorkerResult::Interrupted
+            } else {
+                WorkerResult::Failed("worker did not receive the interruption".to_string())
+            }
+        }
+    }
 
     #[test]
     fn accepts_supported_youtube_hosts() {
@@ -1284,6 +2539,92 @@ mod tests {
     fn rejects_non_youtube_or_unsafe_urls() {
         assert!(validate_youtube_url("https://example.com/watch?v=test").is_err());
         assert!(validate_youtube_url("file:///etc/passwd").is_err());
+    }
+
+    #[test]
+    fn default_download_settings_are_versioned_and_use_four_workers() {
+        let directory = TestDirectory::new();
+        let settings_path = directory.path().join("settings.json");
+        let default_download_path = directory.path().join("audio");
+
+        let settings = load_or_create_download_settings(&settings_path, &default_download_path)
+            .expect("create default settings");
+
+        assert_eq!(settings.schema_version, SETTINGS_SCHEMA_VERSION);
+        assert_eq!(settings.worker_count, DEFAULT_WORKER_COUNT);
+        assert_eq!(
+            settings.download_path,
+            fs::canonicalize(&default_download_path)
+                .expect("canonicalize default download directory")
+                .to_str()
+                .expect("test path is UTF-8")
+        );
+        let saved: DownloadSettings =
+            serde_json::from_slice(&fs::read(&settings_path).expect("read settings"))
+                .expect("read versioned settings JSON");
+        assert_eq!(saved.worker_count, DEFAULT_WORKER_COUNT);
+    }
+
+    #[test]
+    fn legacy_plain_text_destination_migrates_without_changing_its_path() {
+        let directory = TestDirectory::new();
+        let settings_path = directory.path().join("settings");
+        let legacy_download_path = directory.path().join("legacy-audio");
+        fs::create_dir(&legacy_download_path).expect("create legacy download directory");
+        fs::write(
+            &settings_path,
+            legacy_download_path.to_str().expect("test path is UTF-8"),
+        )
+        .expect("write legacy settings");
+
+        let settings = load_or_create_download_settings(&settings_path, directory.path())
+            .expect("migrate legacy settings");
+
+        assert_eq!(settings.worker_count, DEFAULT_WORKER_COUNT);
+        assert_eq!(
+            settings.download_path,
+            fs::canonicalize(&legacy_download_path)
+                .expect("canonicalize legacy directory")
+                .to_str()
+                .expect("test path is UTF-8")
+        );
+        let saved: DownloadSettings =
+            serde_json::from_slice(&fs::read(&settings_path).expect("read migrated settings"))
+                .expect("migrated settings are JSON");
+        assert_eq!(saved.schema_version, SETTINGS_SCHEMA_VERSION);
+        assert_eq!(saved.download_path, settings.download_path);
+    }
+
+    #[test]
+    fn rejects_invalid_worker_counts_from_settings_input() {
+        let directory = TestDirectory::new();
+        let path = directory.path().to_str().expect("test path is UTF-8");
+
+        for worker_count in [0, 9] {
+            assert!(validate_worker_count(worker_count).is_err());
+            assert!(download_settings_from_input(DownloadSettingsInput {
+                download_path: path.to_string(),
+                worker_count,
+            })
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn corrupt_settings_return_an_actionable_error_without_replacing_the_file() {
+        let directory = TestDirectory::new();
+        let settings_path = directory.path().join("settings");
+        let corrupt_contents = "{\"schemaVersion\":1,\"downloadPath\":";
+        fs::write(&settings_path, corrupt_contents).expect("write corrupt settings");
+
+        let error = load_or_create_download_settings(&settings_path, directory.path())
+            .expect_err("corrupt settings should not be accepted");
+
+        assert!(error.contains("Choose a folder"));
+        assert_eq!(
+            fs::read_to_string(&settings_path).expect("read corrupt settings"),
+            corrupt_contents
+        );
     }
 
     #[test]
@@ -1311,6 +2652,441 @@ mod tests {
         assert_eq!(total, 2857);
         assert_eq!(percent, "42.5%");
         assert!(parse_download_progress("unrelated output").is_none());
+    }
+
+    #[test]
+    fn checkpoint_identity_uses_source_destination_kind_and_layout() {
+        let source = Url::parse("https://www.youtube.com/playlist?list=example#ignored").unwrap();
+        let same_source_without_fragment =
+            Url::parse("https://www.youtube.com/playlist?list=example").unwrap();
+        let first = checkpoint_identity(
+            "playlist",
+            &source,
+            Path::new("/downloads/one"),
+            "playlist-static-index-v1",
+        )
+        .unwrap();
+        assert_eq!(first.len(), 64);
+        assert!(first.chars().all(|character| character.is_ascii_hexdigit()));
+        assert_eq!(
+            first,
+            checkpoint_identity(
+                "playlist",
+                &same_source_without_fragment,
+                Path::new("/downloads/one"),
+                "playlist-static-index-v1",
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            first,
+            checkpoint_identity(
+                "playlist",
+                &same_source_without_fragment,
+                Path::new("/downloads/two"),
+                "playlist-static-index-v1",
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            first,
+            checkpoint_identity(
+                "podcast",
+                &same_source_without_fragment,
+                Path::new("/downloads/one"),
+                "podcast-static-index-v1",
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn playlist_queue_keeps_source_order_and_skips_checkpointed_items() {
+        let metadata = PlaylistMetadata {
+            title: None,
+            item_type: Some("playlist".to_string()),
+            entries: Some(vec![
+                PlaylistEntry {
+                    id: Some("first-item".to_string()),
+                    url: Some("first-item".to_string()),
+                    webpage_url: None,
+                    original_url: None,
+                },
+                PlaylistEntry {
+                    id: Some("second-item".to_string()),
+                    url: Some("second-item".to_string()),
+                    webpage_url: None,
+                    original_url: None,
+                },
+            ]),
+        };
+        let items = playlist_items(&metadata, true).unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.source_index)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            items[0].locator,
+            "https://www.youtube.com/watch?v=first-item"
+        );
+        assert_eq!(index_width(&items, 2), 2);
+        assert_eq!(
+            output_template(
+                &OutputLayout::Indexed {
+                    width: 2,
+                    include_uploader: true,
+                },
+                &items[1],
+            ),
+            "%(uploader)s/02 - %(title)s.%(ext)s"
+        );
+
+        let completed = BTreeSet::from([items[0].checkpoint_key.clone()]);
+        let pending = pending_items(&items, &completed);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].source_index, 2);
+    }
+
+    #[test]
+    fn aggregate_progress_never_decreases_completed_items() {
+        let first = DownloadItem {
+            checkpoint_key: "first".to_string(),
+            locator: "https://example.com/first".to_string(),
+            source_index: 1,
+        };
+        let second = DownloadItem {
+            checkpoint_key: "second".to_string(),
+            locator: "https://example.com/second".to_string(),
+            source_index: 2,
+        };
+        let mut progress = AggregateProgress::new(0, 2);
+        progress.start(&first);
+        progress.start(&second);
+        progress.update("first", "42.5%".to_string());
+        progress.finish("first", 1);
+        progress.finish("second", 0);
+
+        assert_eq!(progress.completed, 1);
+        assert_eq!(progress.active.len(), 0);
+    }
+
+    #[test]
+    fn download_manager_rejects_a_second_logical_job() {
+        let manager = DownloadManager::default();
+        let first = manager.claim_job().unwrap();
+        assert!(manager.claim_job().is_err());
+        manager.release_job(&first);
+        assert!(manager.claim_job().is_ok());
+    }
+
+    #[test]
+    fn coordinator_honors_the_configured_worker_cap_and_reports_final_progress() {
+        let directory = TestDirectory::new();
+        let checkpoint_path = directory.path().join("progress.json");
+        let download_path = directory.path().to_path_buf();
+        let items = test_items(TEST_WORKER_COUNT + 3);
+        let item_count = items.len();
+        let manager = DownloadManager::default();
+        let active_job = manager.claim_job().expect("claim coordinator job");
+        let worker_state = Arc::new(ConcurrentWorkerState::default());
+        let worker = Arc::new(ConcurrentWorker {
+            state: worker_state.clone(),
+        });
+        let progress = Arc::new(Mutex::new(Vec::new()));
+        let progress_for_coordinator = progress.clone();
+        let tools = test_runtime_tools();
+        let coordinator_job = active_job.clone();
+        let coordinator_checkpoint_path = checkpoint_path.clone();
+
+        let coordinator = thread::spawn(move || {
+            run_coordinated_download_with_worker(
+                &coordinator_job,
+                "concurrency-job",
+                &coordinator_checkpoint_path,
+                &tools,
+                &download_path,
+                items,
+                OutputLayout::Indexed {
+                    width: 2,
+                    include_uploader: true,
+                },
+                "done",
+                TEST_WORKER_COUNT,
+                worker,
+                move |aggregate| {
+                    progress_for_coordinator
+                        .lock()
+                        .expect("record aggregate progress")
+                        .push((aggregate.completed, aggregate.total, aggregate.active.len()));
+                },
+            )
+        });
+
+        worker_state.wait_for_started(TEST_WORKER_COUNT);
+        assert!(manager.claim_job().is_err());
+        worker_state.release();
+
+        let result = coordinator.join().expect("join coordinator");
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => panic!("coordinator unexpectedly failed: {error}"),
+        };
+        manager.release_job(&active_job);
+
+        assert_eq!(result.status, "completed");
+        assert!(!checkpoint_path.exists());
+
+        let (max_active, mut started) = worker_state.snapshot();
+        started.sort_unstable();
+        assert!(
+            max_active <= TEST_WORKER_COUNT,
+            "started {max_active} workers with a cap of {TEST_WORKER_COUNT}"
+        );
+        assert_eq!(max_active, TEST_WORKER_COUNT);
+        assert_eq!(started, (1..=item_count).collect::<Vec<_>>());
+
+        let progress = progress.lock().expect("read aggregate progress");
+        assert!(!progress.is_empty());
+        assert!(progress
+            .windows(2)
+            .all(|pair| pair[0].0 <= pair[1].0 && pair[0].1 == pair[1].1));
+        assert_eq!(progress.last(), Some(&(item_count, item_count, 0)));
+    }
+
+    #[test]
+    fn resumed_coordinator_retains_the_original_worker_count() {
+        const ORIGINAL_WORKER_COUNT: usize = 2;
+        const LATER_SETTINGS_WORKER_COUNT: usize = 6;
+
+        let directory = TestDirectory::new();
+        let checkpoint_path = directory.path().join("resume.json");
+        let download_path = directory.path().to_path_buf();
+        let items = test_items(ORIGINAL_WORKER_COUNT + 3);
+        let checkpointed_key = items[0].checkpoint_key.clone();
+        write_checkpoint(
+            &checkpoint_path,
+            &DownloadCheckpoint {
+                schema_version: CHECKPOINT_SCHEMA_VERSION,
+                job_id: "resume-worker-count-job".to_string(),
+                completed: BTreeSet::from([checkpointed_key]),
+            },
+        )
+        .expect("seed paused-job checkpoint");
+
+        let manager = DownloadManager::default();
+        let active_job = manager.claim_job().expect("claim resumed coordinator job");
+        let worker_state = Arc::new(ConcurrentWorkerState::default());
+        let worker = Arc::new(ConcurrentWorker {
+            state: worker_state.clone(),
+        });
+        let coordinator_job = active_job.clone();
+        let coordinator_checkpoint_path = checkpoint_path.clone();
+        let tools = test_runtime_tools();
+
+        // A resume request supplies the worker count captured at job start,
+        // not a later setting value. The checkpoint represents the paused job.
+        let coordinator = thread::spawn(move || {
+            run_coordinated_download_with_worker(
+                &coordinator_job,
+                "resume-worker-count-job",
+                &coordinator_checkpoint_path,
+                &tools,
+                &download_path,
+                items,
+                OutputLayout::Indexed {
+                    width: 2,
+                    include_uploader: true,
+                },
+                "done",
+                ORIGINAL_WORKER_COUNT,
+                worker,
+                |_| {},
+            )
+        });
+
+        worker_state.wait_for_started(ORIGINAL_WORKER_COUNT);
+        worker_state.release();
+
+        let result = coordinator.join().expect("join resumed coordinator");
+        let result = result.expect("resumed coordinator should complete");
+        manager.release_job(&active_job);
+
+        let (max_active, _) = worker_state.snapshot();
+        assert_eq!(result.status, "completed");
+        assert_eq!(max_active, ORIGINAL_WORKER_COUNT);
+        assert_ne!(max_active, LATER_SETTINGS_WORKER_COUNT);
+    }
+
+    #[test]
+    fn coordinator_skips_checkpointed_items_and_preserves_successes_after_a_failure() {
+        let directory = TestDirectory::new();
+        let checkpoint_path = directory.path().join("resume.json");
+        let items = test_items(3);
+        let first_key = items[0].checkpoint_key.clone();
+        let successful_key = items[1].checkpoint_key.clone();
+        let failed_key = items[2].checkpoint_key.clone();
+        write_checkpoint(
+            &checkpoint_path,
+            &DownloadCheckpoint {
+                schema_version: CHECKPOINT_SCHEMA_VERSION,
+                job_id: "resume-job".to_string(),
+                completed: BTreeSet::from([first_key.clone()]),
+            },
+        )
+        .expect("seed checkpoint");
+
+        let manager = DownloadManager::default();
+        let active_job = manager.claim_job().expect("claim coordinator job");
+        let worker = Arc::new(ScriptedWorker {
+            failed_key: failed_key.clone(),
+            calls: Mutex::new(Vec::new()),
+        });
+        let result = run_coordinated_download_with_worker(
+            &active_job,
+            "resume-job",
+            &checkpoint_path,
+            &test_runtime_tools(),
+            directory.path(),
+            items,
+            OutputLayout::Indexed {
+                width: 2,
+                include_uploader: false,
+            },
+            "done",
+            2,
+            worker.clone(),
+            |_| {},
+        );
+        manager.release_job(&active_job);
+
+        let error = match result {
+            Ok(result) => panic!("coordinator unexpectedly completed: {}", result.status),
+            Err(error) => error,
+        };
+        assert!(error.contains("1 item(s) could not be downloaded"));
+        assert!(error.contains("2 of 3 item(s) were checkpointed"));
+        assert!(error.contains("item 3: simulated yt-dlp failure"));
+
+        let mut calls = worker
+            .calls
+            .lock()
+            .expect("read scripted worker calls")
+            .clone();
+        calls.sort();
+        assert_eq!(calls, vec![successful_key.clone(), failed_key.clone()]);
+
+        let checkpoint = read_checkpoint(&checkpoint_path, "resume-job").expect("read checkpoint");
+        assert_eq!(
+            checkpoint.completed,
+            BTreeSet::from([first_key, successful_key])
+        );
+        assert!(!checkpoint.completed.contains(&failed_key));
+    }
+
+    fn assert_interrupted_coordinator_cleans_or_retains_checkpoints(
+        stop: bool,
+        worker_count: usize,
+    ) {
+        let directory = TestDirectory::new();
+        let checkpoint_path = directory.path().join("interrupted.json");
+        let items = test_items(worker_count + 2);
+        let retained_key = items[0].checkpoint_key.clone();
+        write_checkpoint(
+            &checkpoint_path,
+            &DownloadCheckpoint {
+                schema_version: CHECKPOINT_SCHEMA_VERSION,
+                job_id: "interruption-job".to_string(),
+                completed: BTreeSet::from([retained_key.clone()]),
+            },
+        )
+        .expect("seed checkpoint");
+
+        let manager = DownloadManager::default();
+        let active_job = manager.claim_job().expect("claim coordinator job");
+        let worker_state = Arc::new(InterruptionWorkerState::default());
+        let worker = Arc::new(InterruptibleWorker {
+            state: worker_state.clone(),
+        });
+        let coordinator_manager = manager.clone();
+        let coordinator_job = active_job.clone();
+        let coordinator_checkpoint_path = checkpoint_path.clone();
+        let tools = test_runtime_tools();
+        let download_path = directory.path().to_path_buf();
+        let coordinator = thread::spawn(move || {
+            let result = run_coordinated_download_with_worker(
+                &coordinator_job,
+                "interruption-job",
+                &coordinator_checkpoint_path,
+                &tools,
+                &download_path,
+                items,
+                OutputLayout::Indexed {
+                    width: 2,
+                    include_uploader: false,
+                },
+                "done",
+                worker_count,
+                worker,
+                |_| {},
+            );
+            coordinator_manager.release_job(&coordinator_job);
+            result
+        });
+
+        worker_state.wait_for_started(worker_count);
+        let requested_job = manager
+            .request_interruption(stop)
+            .expect("request interruption");
+        assert!(Arc::ptr_eq(&active_job, &requested_job));
+
+        let waiting_manager = manager.clone();
+        let waiting_job = requested_job.clone();
+        let (waiter_sender, waiter_receiver) = mpsc::channel();
+        let waiter = thread::spawn(move || {
+            let _ = waiter_sender.send(waiting_manager.wait_for_job(&waiting_job));
+        });
+
+        worker_state.permit_interruption_check();
+        worker_state.wait_for_observed_interruption(worker_count);
+        assert!(matches!(
+            waiter_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        worker_state.release();
+        assert!(waiter_receiver
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("waiter did not observe coordinator completion")
+            .is_ok());
+        waiter.join().expect("join interruption waiter");
+
+        let result = coordinator.join().expect("join coordinator");
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => panic!("coordinator unexpectedly failed: {error}"),
+        };
+        assert_eq!(result.status, if stop { "stopped" } else { "paused" });
+
+        if stop {
+            assert!(!checkpoint_path.exists());
+        } else {
+            let checkpoint =
+                read_checkpoint(&checkpoint_path, "interruption-job").expect("read checkpoint");
+            assert_eq!(checkpoint.completed, BTreeSet::from([retained_key]));
+        }
+    }
+
+    #[test]
+    fn coordinator_pause_interrupts_all_active_workers_and_retains_checkpoints() {
+        assert_interrupted_coordinator_cleans_or_retains_checkpoints(false, 2);
+    }
+
+    #[test]
+    fn coordinator_stop_interrupts_all_active_workers_waits_and_clears_checkpoints() {
+        assert_interrupted_coordinator_cleans_or_retains_checkpoints(true, 2);
     }
 
     #[test]

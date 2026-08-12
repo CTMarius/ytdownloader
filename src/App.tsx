@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
@@ -25,15 +25,25 @@ interface DownloadResult {
   status: "completed" | "stopped" | "paused" | "stopping";
 }
 
+interface DownloadSettings {
+  schemaVersion: number;
+  downloadPath: string;
+  workerCount: number;
+}
+
 interface Notice {
   message: string;
   tone: NoticeTone;
 }
 
 interface DownloadProgress {
-  current: number;
+  jobId: string;
+  requestId: string;
+  completed: number;
   total: number;
-  percent: string;
+  active: number;
+  activeItem: number | null;
+  percent: string | null;
   kind: "single" | "playlist" | "podcast";
 }
 
@@ -41,9 +51,19 @@ interface StartedDownloadParams {
   url: string;
   downloadType: DownloadType;
   path: string;
+  workerCount: number;
 }
 
 const YOUTUBE_HOSTS = ["youtube.com", "youtu.be", "youtube-nocookie.com"];
+const DEFAULT_WORKER_COUNT = 4;
+const MIN_WORKER_COUNT = 1;
+const MAX_WORKER_COUNT = 8;
+
+function isValidWorkerCount(value: number): boolean {
+  return (
+    Number.isInteger(value) && value >= MIN_WORKER_COUNT && value <= MAX_WORKER_COUNT
+  );
+}
 
 function isYouTubeUrl(value: string): boolean {
   try {
@@ -83,6 +103,14 @@ function errorMessage(error: unknown): string {
   }
 
   return "An unexpected error occurred. Please try again.";
+}
+
+function createDownloadRequestId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+
+  return `request-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
 function SetupScreen({
@@ -158,6 +186,7 @@ function SetupScreen({
 function App() {
   const [url, setUrl] = useState("");
   const [downloadPath, setDownloadPath] = useState("");
+  const [workerCount, setWorkerCount] = useState(DEFAULT_WORKER_COUNT);
   const [downloadType, setDownloadType] = useState<DownloadType>("single");
   const [setupPhase, setSetupPhase] = useState<"checking" | "installing" | "ready" | "error">(
     "checking",
@@ -165,14 +194,18 @@ function App() {
   const [setupAttempt, setSetupAttempt] = useState(0);
   const [setupProgress, setSetupProgress] = useState<RuntimeSetupProgress | null>(null);
   const [setupError, setSetupError] = useState<string | null>(null);
-  const [isLoadingPath, setIsLoadingPath] = useState(true);
+  const [isLoadingSettings, setIsLoadingSettings] = useState(true);
   const [isSelectingPath, setIsSelectingPath] = useState(false);
+  const [isSavingWorkerCount, setIsSavingWorkerCount] = useState(false);
   const [isDownloading, setIsDownloading] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
   const [isPausing, setIsPausing] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
   const [resumeParams, setResumeParams] = useState<StartedDownloadParams | null>(null);
+  const activeJobIdRef = useRef<string | null>(null);
+  const activeRequestIdRef = useRef<string | null>(null);
+  const acceptsProgressRef = useRef(false);
   const [toolStatus, setToolStatus] = useState<Notice>({
     message: "Preparing private audio tools…",
     tone: "neutral",
@@ -254,27 +287,35 @@ function App() {
   useEffect(() => {
     let cancelled = false;
 
-    const loadDownloadPath = async () => {
+    const loadDownloadSettings = async () => {
       try {
-        const savedPath = await invoke<string>("get_download_path");
+        const savedSettings = await invoke<DownloadSettings>("get_download_settings");
+        if (!isValidWorkerCount(savedSettings.workerCount)) {
+          throw new Error(
+            `The saved worker count must be between ${MIN_WORKER_COUNT} and ${MAX_WORKER_COUNT}.`,
+          );
+        }
+
         if (!cancelled) {
-          setDownloadPath(savedPath);
+          setDownloadPath(savedSettings.downloadPath);
+          setWorkerCount(savedSettings.workerCount);
         }
       } catch (error) {
         if (!cancelled) {
+          setWorkerCount(DEFAULT_WORKER_COUNT);
           setNotice({
-            message: `Could not load the saved destination: ${errorMessage(error)}`,
+            message: `Could not load saved download settings: ${errorMessage(error)}`,
             tone: "error",
           });
         }
       } finally {
         if (!cancelled) {
-          setIsLoadingPath(false);
+          setIsLoadingSettings(false);
         }
       }
     };
 
-    void loadDownloadPath();
+    void loadDownloadSettings();
 
     return () => {
       cancelled = true;
@@ -286,10 +327,29 @@ function App() {
     let disposed = false;
 
     void listen<DownloadProgress>("download-progress", (event) => {
-      const { current, total } = event.payload;
-      if (current > 0 && total > 0) {
-        setProgress(event.payload);
+      const nextProgress = event.payload;
+      if (
+        !acceptsProgressRef.current ||
+        nextProgress.total <= 0 ||
+        nextProgress.requestId !== activeRequestIdRef.current
+      ) {
+        return;
       }
+
+      if (activeJobIdRef.current && activeJobIdRef.current !== nextProgress.jobId) {
+        return;
+      }
+
+      activeJobIdRef.current ??= nextProgress.jobId;
+      setProgress((currentProgress) => {
+        if (
+          currentProgress?.jobId === nextProgress.jobId &&
+          nextProgress.completed < currentProgress.completed
+        ) {
+          return currentProgress;
+        }
+        return nextProgress;
+      });
     })
       .then((stopListening) => {
         if (disposed) {
@@ -328,8 +388,15 @@ function App() {
         return;
       }
 
-      const savedPath = await invoke<string>("save_download_path", { path });
-      setDownloadPath(savedPath);
+      const savedSettings = await invoke<DownloadSettings>("save_download_settings", {
+        settings: {
+          downloadPath: path,
+          workerCount,
+        },
+      });
+      resetPauseStateIfNeeded();
+      setDownloadPath(savedSettings.downloadPath);
+      setWorkerCount(savedSettings.workerCount);
       setNotice({
         message: "Download destination saved.",
         tone: "success",
@@ -344,13 +411,56 @@ function App() {
     }
   };
 
+  const handleWorkerCountChange = async (value: string) => {
+    const nextWorkerCount = Number(value);
+    if (!isValidWorkerCount(nextWorkerCount)) {
+      setNotice({
+        message: `Choose between ${MIN_WORKER_COUNT} and ${MAX_WORKER_COUNT} concurrent workers.`,
+        tone: "error",
+      });
+      return;
+    }
+
+    setIsSavingWorkerCount(true);
+    try {
+      const savedSettings = await invoke<DownloadSettings>("save_download_settings", {
+        settings: {
+          downloadPath,
+          workerCount: nextWorkerCount,
+        },
+      });
+      setDownloadPath(savedSettings.downloadPath);
+      setWorkerCount(savedSettings.workerCount);
+      setNotice({
+        message: "Concurrent worker setting saved.",
+        tone: "success",
+      });
+    } catch (error) {
+      setNotice({
+        message: `Could not save the worker setting: ${errorMessage(error)}`,
+        tone: "error",
+      });
+    } finally {
+      setIsSavingWorkerCount(false);
+    }
+  };
+
   const startDownload = async (params: StartedDownloadParams) => {
-    const { url: startUrl, downloadType: startType, path: startPath } = params;
+    const {
+      url: startUrl,
+      downloadType: startType,
+      path: startPath,
+      workerCount: startWorkerCount,
+    } = params;
+    const requestId = createDownloadRequestId();
 
     setIsDownloading(true);
     setIsPaused(false);
     setProgress(null);
     setResumeParams(params);
+    activeJobIdRef.current = null;
+    activeRequestIdRef.current = requestId;
+    acceptsProgressRef.current = true;
     setNotice({
       message:
         startType === "podcast"
@@ -365,11 +475,15 @@ function App() {
           ? await invoke<DownloadResult>("download_podcast", {
               url: startUrl,
               path: startPath,
+              requestId,
+              workerCount: startWorkerCount,
             })
           : await invoke<DownloadResult>("download_audio", {
               url: startUrl,
               downloadType: startType,
               path: startPath,
+              requestId,
+              workerCount: startWorkerCount,
             });
 
       if (result.status === "paused") {
@@ -393,6 +507,11 @@ function App() {
         tone: "error",
       });
     } finally {
+      if (activeRequestIdRef.current === requestId) {
+        acceptsProgressRef.current = false;
+        activeJobIdRef.current = null;
+        activeRequestIdRef.current = null;
+      }
       setIsDownloading(false);
     }
   };
@@ -402,6 +521,9 @@ function App() {
       setIsPaused(false);
       setResumeParams(null);
       setProgress(null);
+      acceptsProgressRef.current = false;
+      activeJobIdRef.current = null;
+      activeRequestIdRef.current = null;
     }
   };
 
@@ -446,7 +568,12 @@ function App() {
       return;
     }
 
-    await startDownload({ url: trimmedUrl, downloadType, path: trimmedPath });
+    await startDownload({
+      url: trimmedUrl,
+      downloadType,
+      path: trimmedPath,
+      workerCount,
+    });
   };
 
   const handleResume = async () => {
@@ -458,6 +585,10 @@ function App() {
 
   const handlePause = async () => {
     setIsPausing(true);
+    setNotice({
+      message: "Pausing all active download workers…",
+      tone: "neutral",
+    });
     try {
       await invoke<DownloadResult>("pause_download");
     } catch (error) {
@@ -472,6 +603,10 @@ function App() {
 
   const handleStop = async () => {
     setIsStopping(true);
+    setNotice({
+      message: "Stopping all active download workers…",
+      tone: "neutral",
+    });
     try {
       await invoke<DownloadResult>("stop_download");
     } catch (error) {
@@ -484,7 +619,10 @@ function App() {
     }
   };
 
-  const downloadUnavailable = isLoadingPath || isSelectingPath || isDownloading;
+  const downloadUnavailable =
+    isLoadingSettings || isSelectingPath || isSavingWorkerCount || isDownloading;
+  const workerCountLocked =
+    isLoadingSettings || isSelectingPath || isSavingWorkerCount || isDownloading || isPaused;
   const isPodcast = downloadType === "podcast";
 
   if (setupPhase !== "ready") {
@@ -608,6 +746,33 @@ function App() {
           </fieldset>
 
           <div className="field">
+            <label htmlFor="worker-count">Concurrent playlist and podcast workers</label>
+            <select
+              id="worker-count"
+              name="worker-count"
+              value={workerCount}
+              onChange={(event) => {
+                void handleWorkerCountChange(event.target.value);
+              }}
+              aria-describedby="worker-count-help"
+              disabled={workerCountLocked}
+            >
+              {Array.from(
+                { length: MAX_WORKER_COUNT - MIN_WORKER_COUNT + 1 },
+                (_, index) => MIN_WORKER_COUNT + index,
+              ).map((count) => (
+                <option key={count} value={count}>
+                  {count} {count === 1 ? "worker" : "workers"}
+                </option>
+              ))}
+            </select>
+            <p id="worker-count-help" className="help-text">
+              Playlists and podcast feeds download up to this many items at once. Higher counts
+              use more network and CPU; single videos always use one worker.
+            </p>
+          </div>
+
+          <div className="field">
             <span id="destination-label" className="field-label">
               Download destination
             </span>
@@ -623,7 +788,9 @@ function App() {
                 type="button"
                 className="secondary-button"
                 onClick={handleSelectPath}
-                disabled={isLoadingPath || isDownloading || isSelectingPath}
+                disabled={
+                  isLoadingSettings || isDownloading || isSelectingPath || isSavingWorkerCount
+                }
               >
                 {isSelectingPath ? "Opening…" : "Choose folder"}
               </button>
@@ -656,19 +823,22 @@ function App() {
             <div className="progress-meta">
               <span>
                 {progress
-                  ? `${progress.current} of ${progress.total} ${
+                  ? `${progress.completed} of ${progress.total} ${
                       progress.kind === "podcast" ? "episodes" : "items"
-                    } downloaded`
+                    } downloaded${progress.active > 0 ? ` · ${progress.active} worker${progress.active === 1 ? "" : "s"} active` : ""}`
                   : "Preparing download…"}
               </span>
-              <strong>{progress?.percent ?? ""}</strong>
+              <strong>
+                {progress?.percent ??
+                  (progress?.activeItem ? `Item ${progress.activeItem}` : "")}
+              </strong>
             </div>
             <div className="progress-bar-track">
               <div
                 className="progress-bar-fill"
                 style={{
                   width: progress
-                    ? `${Math.min(100, Math.round((progress.current / progress.total) * 100))}%`
+                    ? `${Math.min(100, Math.round((progress.completed / progress.total) * 100))}%`
                     : "0%",
                 }}
               />

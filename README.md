@@ -7,7 +7,7 @@ This is a Tauri-based desktop application for downloading audio from YouTube and
 - Download individual YouTube videos or entire playlists as audio files
 - Download every available episode from a public podcast RSS feed
 - Save audio files in MP3 format with high quality (320K)
-- Select and save a custom download path
+- Select and save a custom download path and concurrent-worker preference
 - Live progress bar with item counts for playlist and podcast downloads
 - Pause and resume long downloads, or stop them outright, without freezing the UI
 - Cross-platform support (Windows, macOS, Linux)
@@ -49,10 +49,17 @@ Feeds that require authentication, are not recognized by `yt-dlp` as a playlist,
 
 ## Progress, pause, and stop
 
-Playlist and podcast downloads run in the background and report progress (current/total items and percent) as `yt-dlp` processes each item, so the app never locks up on large feeds or playlists.
+Choose **1–8 concurrent workers** in the app (the default is **4**) to control how many playlist
+videos or podcast episodes download at once. More workers can finish large collections sooner, but
+use more network bandwidth and CPU. Single-video downloads always use one worker. The preference is
+saved with the download destination and applies to new playlist and podcast jobs; a paused job keeps
+the worker count it started with when resumed.
 
-- **Pause** stops the current `yt-dlp` process but remembers which items already finished (via a per-source download archive), so **Resume** picks up where it left off instead of re-downloading everything.
-- **Stop** ends the download immediately and clears its saved progress, so a future download of the same source starts fresh.
+The app still runs only one playlist, podcast, or single-video job at a time, and reports aggregate
+completed/total progress plus active workers so the app never locks up on large feeds or playlists.
+
+- **Pause** stops every active worker and remembers checkpointed items, so **Resume** picks up where it left off instead of re-downloading completed items.
+- **Stop** waits for every active worker to exit, then clears saved progress so a future download of the same source starts fresh.
 
 ## Prerequisites
 
@@ -139,6 +146,4 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## Support
 
 If you encounter any issues or have questions, please file an issue on the GitHub repository.
-
-
 

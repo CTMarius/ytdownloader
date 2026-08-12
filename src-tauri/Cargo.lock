@@ -5582,7 +5582,7 @@ dependencies = [
 
 [[package]]
 name = "ytdownloader"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "dirs 4.0.0",
  "reqwest 0.12.28",
