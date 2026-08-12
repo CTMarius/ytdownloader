@@ -163,6 +163,44 @@ enum WorkerResult {
     Failed(String),
 }
 
+/// Runs one item from the coordinator queue. Keeping this boundary private lets
+/// the coordinator be exercised with controlled workers without changing the
+/// command or runtime-tool trust boundary.
+trait DownloadWorker: Send + Sync {
+    fn run(
+        &self,
+        active_job: &Arc<ActiveDownload>,
+        tools: &RuntimeTools,
+        download_path: &Path,
+        output_layout: &OutputLayout,
+        item: &DownloadItem,
+        sender: &mpsc::Sender<WorkerEvent>,
+    ) -> WorkerResult;
+}
+
+struct YtDlpDownloadWorker;
+
+impl DownloadWorker for YtDlpDownloadWorker {
+    fn run(
+        &self,
+        active_job: &Arc<ActiveDownload>,
+        tools: &RuntimeTools,
+        download_path: &Path,
+        output_layout: &OutputLayout,
+        item: &DownloadItem,
+        sender: &mpsc::Sender<WorkerEvent>,
+    ) -> WorkerResult {
+        run_download_worker(
+            active_job,
+            tools,
+            download_path,
+            output_layout,
+            item,
+            sender,
+        )
+    }
+}
+
 struct AggregateProgress {
     completed: usize,
     total: usize,
@@ -1113,14 +1151,44 @@ fn run_coordinated_download(
     output_layout: OutputLayout,
     success_message: String,
 ) -> Result<DownloadResult, String> {
-    let mut checkpoint = read_checkpoint(&checkpoint_path, &job_id)?;
+    run_coordinated_download_with_worker(
+        active_job,
+        &job_id,
+        &checkpoint_path,
+        tools,
+        download_path,
+        items,
+        output_layout,
+        &success_message,
+        Arc::new(YtDlpDownloadWorker),
+        |aggregate| aggregate.emit(app, &job_id, request_id, kind),
+    )
+}
+
+fn run_coordinated_download_with_worker<W, F>(
+    active_job: &Arc<ActiveDownload>,
+    job_id: &str,
+    checkpoint_path: &Path,
+    tools: &RuntimeTools,
+    download_path: &Path,
+    items: Vec<DownloadItem>,
+    output_layout: OutputLayout,
+    success_message: &str,
+    worker: Arc<W>,
+    emit_progress: F,
+) -> Result<DownloadResult, String>
+where
+    W: DownloadWorker + 'static,
+    F: Fn(&AggregateProgress),
+{
+    let mut checkpoint = read_checkpoint(checkpoint_path, job_id)?;
     let pending = pending_items(&items, &checkpoint.completed);
     let completed = completed_item_count(&items, &checkpoint.completed);
     let mut aggregate = AggregateProgress::new(completed, items.len());
-    aggregate.emit(app, &job_id, request_id, kind);
+    emit_progress(&aggregate);
 
     if active_job.is_interrupted() {
-        return finish_interruption(active_job, &checkpoint_path);
+        return finish_interruption(active_job, checkpoint_path);
     }
 
     let queue = Arc::new(Mutex::new(VecDeque::from(pending)));
@@ -1140,6 +1208,7 @@ fn run_coordinated_download(
         let worker_tools = tools.clone();
         let worker_path = download_path.to_path_buf();
         let worker_layout = output_layout.clone();
+        let worker_runner = worker.clone();
         workers.push(thread::spawn(move || loop {
             if worker_job.is_interrupted() {
                 break;
@@ -1158,7 +1227,7 @@ fn run_coordinated_download(
             {
                 break;
             }
-            let result = run_download_worker(
+            let result = worker_runner.run(
                 &worker_job,
                 &worker_tools,
                 &worker_path,
@@ -1181,20 +1250,20 @@ fn run_coordinated_download(
         match event {
             WorkerEvent::Started(item) => {
                 aggregate.start(&item);
-                aggregate.emit(app, &job_id, request_id, kind);
+                emit_progress(&aggregate);
             }
             WorkerEvent::Progress {
                 checkpoint_key,
                 percent,
             } => {
                 aggregate.update(&checkpoint_key, percent);
-                aggregate.emit(app, &job_id, request_id, kind);
+                emit_progress(&aggregate);
             }
             WorkerEvent::Finished { item, result } => {
                 match result {
                     WorkerResult::Completed => {
                         if checkpoint.completed.insert(item.checkpoint_key.clone()) {
-                            if let Err(error) = write_checkpoint(&checkpoint_path, &checkpoint) {
+                            if let Err(error) = write_checkpoint(checkpoint_path, &checkpoint) {
                                 checkpoint.completed.remove(&item.checkpoint_key);
                                 failures.push(format!(
                                     "item {} could not save its resume checkpoint ({error})",
@@ -1210,7 +1279,7 @@ fn run_coordinated_download(
                 }
                 let completed = completed_item_count(&items, &checkpoint.completed);
                 aggregate.finish(&item.checkpoint_key, completed);
-                aggregate.emit(app, &job_id, request_id, kind);
+                emit_progress(&aggregate);
             }
         }
     }
@@ -1222,7 +1291,7 @@ fn run_coordinated_download(
     }
 
     if active_job.is_interrupted() {
-        return finish_interruption(active_job, &checkpoint_path);
+        return finish_interruption(active_job, checkpoint_path);
     }
 
     if !failures.is_empty() {
@@ -1241,9 +1310,9 @@ fn run_coordinated_download(
         ));
     }
 
-    clear_checkpoint(&checkpoint_path)?;
+    clear_checkpoint(checkpoint_path)?;
     Ok(DownloadResult {
-        message: success_message,
+        message: success_message.to_string(),
         status: "completed".to_string(),
     })
 }
@@ -1981,12 +2050,314 @@ fn main() {
 mod tests {
     use super::{
         checkpoint_identity, index_width, output_template, parse_download_progress, pending_items,
-        playlist_items, runtime_assets_for, sanitize_podcast_folder_title,
-        validate_podcast_feed_url, validate_youtube_url, AggregateProgress, DownloadItem,
-        DownloadManager, OutputLayout, PlaylistEntry, PlaylistMetadata,
+        playlist_items, read_checkpoint, run_coordinated_download_with_worker, runtime_assets_for,
+        sanitize_podcast_folder_title, validate_podcast_feed_url, validate_youtube_url,
+        write_checkpoint, ActiveDownload, AggregateProgress, DownloadCheckpoint, DownloadItem,
+        DownloadManager, DownloadWorker, OutputLayout, PlaylistEntry, PlaylistMetadata,
+        RuntimeTools, WorkerEvent, WorkerResult, CHECKPOINT_SCHEMA_VERSION, DOWNLOAD_WORKER_LIMIT,
     };
-    use std::{collections::BTreeSet, path::Path};
+    use std::{
+        collections::BTreeSet,
+        fs,
+        path::{Path, PathBuf},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            mpsc, Arc, Condvar, Mutex,
+        },
+        thread,
+        time::Duration,
+    };
     use url::Url;
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+    static TEST_DIRECTORY_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    struct TestDirectory {
+        path: PathBuf,
+    }
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "ytdownloader-coordinator-test-{}-{}",
+                std::process::id(),
+                TEST_DIRECTORY_COUNTER.fetch_add(1, Ordering::SeqCst)
+            ));
+            fs::create_dir(&path).expect("create isolated test directory");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn test_items(count: usize) -> Vec<DownloadItem> {
+        (1..=count)
+            .map(|source_index| DownloadItem {
+                checkpoint_key: format!("item:{source_index}"),
+                locator: format!("https://example.test/{source_index}"),
+                source_index,
+            })
+            .collect()
+    }
+
+    fn test_runtime_tools() -> RuntimeTools {
+        RuntimeTools {
+            directory: PathBuf::from("test-runtime"),
+            yt_dlp: PathBuf::from("test-runtime/yt-dlp"),
+            ffmpeg: PathBuf::from("test-runtime/ffmpeg"),
+            ffprobe: PathBuf::from("test-runtime/ffprobe"),
+        }
+    }
+
+    #[derive(Default)]
+    struct ConcurrentWorkerSnapshot {
+        active: usize,
+        max_active: usize,
+        started: Vec<usize>,
+        release: bool,
+    }
+
+    #[derive(Default)]
+    struct ConcurrentWorkerState {
+        snapshot: Mutex<ConcurrentWorkerSnapshot>,
+        changed: Condvar,
+    }
+
+    impl ConcurrentWorkerState {
+        fn wait_for_started(&self, expected: usize) {
+            let snapshot = self.snapshot.lock().expect("lock concurrent worker state");
+            let (snapshot, timeout) = self
+                .changed
+                .wait_timeout_while(snapshot, TEST_TIMEOUT, |snapshot| {
+                    snapshot.started.len() < expected
+                })
+                .expect("wait for concurrent workers");
+            assert!(
+                !timeout.timed_out(),
+                "only {} of {expected} workers started",
+                snapshot.started.len()
+            );
+        }
+
+        fn release(&self) {
+            let mut snapshot = self.snapshot.lock().expect("lock concurrent worker state");
+            snapshot.release = true;
+            self.changed.notify_all();
+        }
+
+        fn snapshot(&self) -> (usize, Vec<usize>) {
+            let snapshot = self.snapshot.lock().expect("lock concurrent worker state");
+            (snapshot.max_active, snapshot.started.clone())
+        }
+    }
+
+    struct ConcurrentWorker {
+        state: Arc<ConcurrentWorkerState>,
+    }
+
+    impl DownloadWorker for ConcurrentWorker {
+        fn run(
+            &self,
+            _active_job: &Arc<ActiveDownload>,
+            _tools: &RuntimeTools,
+            _download_path: &Path,
+            _output_layout: &OutputLayout,
+            item: &DownloadItem,
+            sender: &mpsc::Sender<WorkerEvent>,
+        ) -> WorkerResult {
+            {
+                let mut snapshot = self
+                    .state
+                    .snapshot
+                    .lock()
+                    .expect("lock concurrent worker state");
+                snapshot.active += 1;
+                snapshot.max_active = snapshot.max_active.max(snapshot.active);
+                snapshot.started.push(item.source_index);
+                self.state.changed.notify_all();
+            }
+            let _ = sender.send(WorkerEvent::Progress {
+                checkpoint_key: item.checkpoint_key.clone(),
+                percent: "50.0%".to_string(),
+            });
+
+            let mut snapshot = self
+                .state
+                .snapshot
+                .lock()
+                .expect("lock concurrent worker state");
+            while !snapshot.release {
+                snapshot = self
+                    .state
+                    .changed
+                    .wait(snapshot)
+                    .expect("wait for concurrent worker release");
+            }
+            snapshot.active -= 1;
+            self.state.changed.notify_all();
+            WorkerResult::Completed
+        }
+    }
+
+    struct ScriptedWorker {
+        failed_key: String,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl DownloadWorker for ScriptedWorker {
+        fn run(
+            &self,
+            _active_job: &Arc<ActiveDownload>,
+            _tools: &RuntimeTools,
+            _download_path: &Path,
+            _output_layout: &OutputLayout,
+            item: &DownloadItem,
+            sender: &mpsc::Sender<WorkerEvent>,
+        ) -> WorkerResult {
+            self.calls
+                .lock()
+                .expect("record scripted worker call")
+                .push(item.checkpoint_key.clone());
+            let _ = sender.send(WorkerEvent::Progress {
+                checkpoint_key: item.checkpoint_key.clone(),
+                percent: "25.0%".to_string(),
+            });
+
+            if item.checkpoint_key == self.failed_key {
+                WorkerResult::Failed("simulated yt-dlp failure".to_string())
+            } else {
+                WorkerResult::Completed
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct InterruptionWorkerSnapshot {
+        started: usize,
+        observed_interruption: usize,
+        permit_interruption_check: bool,
+        release: bool,
+    }
+
+    #[derive(Default)]
+    struct InterruptionWorkerState {
+        snapshot: Mutex<InterruptionWorkerSnapshot>,
+        changed: Condvar,
+    }
+
+    impl InterruptionWorkerState {
+        fn wait_for_started(&self, expected: usize) {
+            let snapshot = self
+                .snapshot
+                .lock()
+                .expect("lock interruption worker state");
+            let (snapshot, timeout) = self
+                .changed
+                .wait_timeout_while(snapshot, TEST_TIMEOUT, |snapshot| {
+                    snapshot.started < expected
+                })
+                .expect("wait for interruption workers");
+            assert!(
+                !timeout.timed_out(),
+                "only {} of {expected} workers started",
+                snapshot.started
+            );
+        }
+
+        fn permit_interruption_check(&self) {
+            let mut snapshot = self
+                .snapshot
+                .lock()
+                .expect("lock interruption worker state");
+            snapshot.permit_interruption_check = true;
+            self.changed.notify_all();
+        }
+
+        fn wait_for_observed_interruption(&self, expected: usize) {
+            let snapshot = self
+                .snapshot
+                .lock()
+                .expect("lock interruption worker state");
+            let (snapshot, timeout) = self
+                .changed
+                .wait_timeout_while(snapshot, TEST_TIMEOUT, |snapshot| {
+                    snapshot.observed_interruption < expected
+                })
+                .expect("wait for worker interruption observations");
+            assert!(
+                !timeout.timed_out(),
+                "only {} of {expected} workers observed the interruption",
+                snapshot.observed_interruption
+            );
+        }
+
+        fn release(&self) {
+            let mut snapshot = self
+                .snapshot
+                .lock()
+                .expect("lock interruption worker state");
+            snapshot.release = true;
+            self.changed.notify_all();
+        }
+    }
+
+    struct InterruptibleWorker {
+        state: Arc<InterruptionWorkerState>,
+    }
+
+    impl DownloadWorker for InterruptibleWorker {
+        fn run(
+            &self,
+            active_job: &Arc<ActiveDownload>,
+            _tools: &RuntimeTools,
+            _download_path: &Path,
+            _output_layout: &OutputLayout,
+            _item: &DownloadItem,
+            _sender: &mpsc::Sender<WorkerEvent>,
+        ) -> WorkerResult {
+            let mut snapshot = self
+                .state
+                .snapshot
+                .lock()
+                .expect("lock interruption worker state");
+            snapshot.started += 1;
+            self.state.changed.notify_all();
+            while !snapshot.permit_interruption_check {
+                snapshot = self
+                    .state
+                    .changed
+                    .wait(snapshot)
+                    .expect("wait to check interruption");
+            }
+
+            let interrupted = active_job.is_interrupted();
+            if interrupted {
+                snapshot.observed_interruption += 1;
+                self.state.changed.notify_all();
+            }
+            while !snapshot.release {
+                snapshot = self
+                    .state
+                    .changed
+                    .wait(snapshot)
+                    .expect("wait for interruption worker release");
+            }
+
+            if interrupted {
+                WorkerResult::Interrupted
+            } else {
+                WorkerResult::Failed("worker did not receive the interruption".to_string())
+            }
+        }
+    }
 
     #[test]
     fn accepts_supported_youtube_hosts() {
@@ -2153,6 +2524,243 @@ mod tests {
         assert!(manager.claim_job().is_err());
         manager.release_job(&first);
         assert!(manager.claim_job().is_ok());
+    }
+
+    #[test]
+    fn coordinator_bounds_workers_runs_each_item_once_and_reports_final_progress() {
+        let directory = TestDirectory::new();
+        let checkpoint_path = directory.path().join("progress.json");
+        let download_path = directory.path().to_path_buf();
+        let items = test_items(DOWNLOAD_WORKER_LIMIT + 3);
+        let item_count = items.len();
+        let manager = DownloadManager::default();
+        let active_job = manager.claim_job().expect("claim coordinator job");
+        let worker_state = Arc::new(ConcurrentWorkerState::default());
+        let worker = Arc::new(ConcurrentWorker {
+            state: worker_state.clone(),
+        });
+        let progress = Arc::new(Mutex::new(Vec::new()));
+        let progress_for_coordinator = progress.clone();
+        let tools = test_runtime_tools();
+        let coordinator_job = active_job.clone();
+        let coordinator_checkpoint_path = checkpoint_path.clone();
+
+        let coordinator = thread::spawn(move || {
+            run_coordinated_download_with_worker(
+                &coordinator_job,
+                "concurrency-job",
+                &coordinator_checkpoint_path,
+                &tools,
+                &download_path,
+                items,
+                OutputLayout::Indexed {
+                    width: 2,
+                    include_uploader: true,
+                },
+                "done",
+                worker,
+                move |aggregate| {
+                    progress_for_coordinator
+                        .lock()
+                        .expect("record aggregate progress")
+                        .push((aggregate.completed, aggregate.total, aggregate.active.len()));
+                },
+            )
+        });
+
+        worker_state.wait_for_started(DOWNLOAD_WORKER_LIMIT);
+        assert!(manager.claim_job().is_err());
+        worker_state.release();
+
+        let result = coordinator.join().expect("join coordinator");
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => panic!("coordinator unexpectedly failed: {error}"),
+        };
+        manager.release_job(&active_job);
+
+        assert_eq!(result.status, "completed");
+        assert!(!checkpoint_path.exists());
+
+        let (max_active, mut started) = worker_state.snapshot();
+        started.sort_unstable();
+        assert!(
+            max_active <= DOWNLOAD_WORKER_LIMIT,
+            "started {max_active} workers with a cap of {DOWNLOAD_WORKER_LIMIT}"
+        );
+        assert_eq!(max_active, DOWNLOAD_WORKER_LIMIT);
+        assert_eq!(started, (1..=item_count).collect::<Vec<_>>());
+
+        let progress = progress.lock().expect("read aggregate progress");
+        assert!(!progress.is_empty());
+        assert!(progress
+            .windows(2)
+            .all(|pair| pair[0].0 <= pair[1].0 && pair[0].1 == pair[1].1));
+        assert_eq!(progress.last(), Some(&(item_count, item_count, 0)));
+    }
+
+    #[test]
+    fn coordinator_skips_checkpointed_items_and_preserves_successes_after_a_failure() {
+        let directory = TestDirectory::new();
+        let checkpoint_path = directory.path().join("resume.json");
+        let items = test_items(3);
+        let first_key = items[0].checkpoint_key.clone();
+        let successful_key = items[1].checkpoint_key.clone();
+        let failed_key = items[2].checkpoint_key.clone();
+        write_checkpoint(
+            &checkpoint_path,
+            &DownloadCheckpoint {
+                schema_version: CHECKPOINT_SCHEMA_VERSION,
+                job_id: "resume-job".to_string(),
+                completed: BTreeSet::from([first_key.clone()]),
+            },
+        )
+        .expect("seed checkpoint");
+
+        let manager = DownloadManager::default();
+        let active_job = manager.claim_job().expect("claim coordinator job");
+        let worker = Arc::new(ScriptedWorker {
+            failed_key: failed_key.clone(),
+            calls: Mutex::new(Vec::new()),
+        });
+        let result = run_coordinated_download_with_worker(
+            &active_job,
+            "resume-job",
+            &checkpoint_path,
+            &test_runtime_tools(),
+            directory.path(),
+            items,
+            OutputLayout::Indexed {
+                width: 2,
+                include_uploader: false,
+            },
+            "done",
+            worker.clone(),
+            |_| {},
+        );
+        manager.release_job(&active_job);
+
+        let error = match result {
+            Ok(result) => panic!("coordinator unexpectedly completed: {}", result.status),
+            Err(error) => error,
+        };
+        assert!(error.contains("1 item(s) could not be downloaded"));
+        assert!(error.contains("2 of 3 item(s) were checkpointed"));
+        assert!(error.contains("item 3: simulated yt-dlp failure"));
+
+        let mut calls = worker
+            .calls
+            .lock()
+            .expect("read scripted worker calls")
+            .clone();
+        calls.sort();
+        assert_eq!(calls, vec![successful_key.clone(), failed_key.clone()]);
+
+        let checkpoint = read_checkpoint(&checkpoint_path, "resume-job").expect("read checkpoint");
+        assert_eq!(
+            checkpoint.completed,
+            BTreeSet::from([first_key, successful_key])
+        );
+        assert!(!checkpoint.completed.contains(&failed_key));
+    }
+
+    fn assert_interrupted_coordinator_cleans_or_retains_checkpoints(stop: bool) {
+        let directory = TestDirectory::new();
+        let checkpoint_path = directory.path().join("interrupted.json");
+        let items = test_items(DOWNLOAD_WORKER_LIMIT + 2);
+        let retained_key = items[0].checkpoint_key.clone();
+        write_checkpoint(
+            &checkpoint_path,
+            &DownloadCheckpoint {
+                schema_version: CHECKPOINT_SCHEMA_VERSION,
+                job_id: "interruption-job".to_string(),
+                completed: BTreeSet::from([retained_key.clone()]),
+            },
+        )
+        .expect("seed checkpoint");
+
+        let manager = DownloadManager::default();
+        let active_job = manager.claim_job().expect("claim coordinator job");
+        let worker_state = Arc::new(InterruptionWorkerState::default());
+        let worker = Arc::new(InterruptibleWorker {
+            state: worker_state.clone(),
+        });
+        let coordinator_manager = manager.clone();
+        let coordinator_job = active_job.clone();
+        let coordinator_checkpoint_path = checkpoint_path.clone();
+        let tools = test_runtime_tools();
+        let download_path = directory.path().to_path_buf();
+        let coordinator = thread::spawn(move || {
+            let result = run_coordinated_download_with_worker(
+                &coordinator_job,
+                "interruption-job",
+                &coordinator_checkpoint_path,
+                &tools,
+                &download_path,
+                items,
+                OutputLayout::Indexed {
+                    width: 2,
+                    include_uploader: false,
+                },
+                "done",
+                worker,
+                |_| {},
+            );
+            coordinator_manager.release_job(&coordinator_job);
+            result
+        });
+
+        worker_state.wait_for_started(DOWNLOAD_WORKER_LIMIT);
+        let requested_job = manager
+            .request_interruption(stop)
+            .expect("request interruption");
+        assert!(Arc::ptr_eq(&active_job, &requested_job));
+
+        let waiting_manager = manager.clone();
+        let waiting_job = requested_job.clone();
+        let (waiter_sender, waiter_receiver) = mpsc::channel();
+        let waiter = thread::spawn(move || {
+            let _ = waiter_sender.send(waiting_manager.wait_for_job(&waiting_job));
+        });
+
+        worker_state.permit_interruption_check();
+        worker_state.wait_for_observed_interruption(DOWNLOAD_WORKER_LIMIT);
+        assert!(matches!(
+            waiter_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        worker_state.release();
+        assert!(waiter_receiver
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("waiter did not observe coordinator completion")
+            .is_ok());
+        waiter.join().expect("join interruption waiter");
+
+        let result = coordinator.join().expect("join coordinator");
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => panic!("coordinator unexpectedly failed: {error}"),
+        };
+        assert_eq!(result.status, if stop { "stopped" } else { "paused" });
+
+        if stop {
+            assert!(!checkpoint_path.exists());
+        } else {
+            let checkpoint =
+                read_checkpoint(&checkpoint_path, "interruption-job").expect("read checkpoint");
+            assert_eq!(checkpoint.completed, BTreeSet::from([retained_key]));
+        }
+    }
+
+    #[test]
+    fn coordinator_pause_interrupts_all_active_workers_and_retains_checkpoints() {
+        assert_interrupted_coordinator_cleans_or_retains_checkpoints(false);
+    }
+
+    #[test]
+    fn coordinator_stop_interrupts_all_active_workers_waits_and_clears_checkpoints() {
+        assert_interrupted_coordinator_cleans_or_retains_checkpoints(true);
     }
 
     #[test]
