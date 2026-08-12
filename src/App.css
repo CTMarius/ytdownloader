@@ -21,7 +21,8 @@ body {
 }
 
 button,
-input {
+input,
+select {
   font: inherit;
 }
 
@@ -238,7 +239,8 @@ legend {
   font-weight: 750;
 }
 
-input[type="url"] {
+input[type="url"],
+select {
   width: 100%;
   padding: 0.78rem 0.85rem;
   border: 1px solid #bbc8dc;
@@ -248,17 +250,20 @@ input[type="url"] {
   transition: border-color 150ms ease, box-shadow 150ms ease;
 }
 
-input[type="url"]:hover:not(:disabled) {
+input[type="url"]:hover:not(:disabled),
+select:hover:not(:disabled) {
   border-color: #8d9fbd;
 }
 
 input[type="url"]:focus-visible,
+select:focus-visible,
 button:focus-visible {
   outline: 3px solid rgba(53, 95, 206, 0.28);
   outline-offset: 2px;
 }
 
-input[type="url"]:focus-visible {
+input[type="url"]:focus-visible,
+select:focus-visible {
   border-color: #355fce;
 }
 

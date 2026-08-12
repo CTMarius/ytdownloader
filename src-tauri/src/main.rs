@@ -24,7 +24,10 @@ const RUNTIME_SCHEMA_VERSION: u8 = 1;
 const YT_DLP_VERSION: &str = "2026.07.04";
 const FFMPEG_RELEASE: &str = "b6.1.1";
 const MAX_RUNTIME_ASSET_BYTES: u64 = 500 * 1024 * 1024;
-const DOWNLOAD_WORKER_LIMIT: usize = 4;
+const SETTINGS_SCHEMA_VERSION: u8 = 1;
+const DEFAULT_WORKER_COUNT: usize = 4;
+const MIN_WORKER_COUNT: usize = 1;
+const MAX_WORKER_COUNT: usize = 8;
 const CHECKPOINT_SCHEMA_VERSION: u8 = 1;
 const PLAYLIST_LAYOUT_VERSION: &str = "playlist-static-index-v1";
 const PODCAST_LAYOUT_VERSION: &str = "podcast-static-index-v1";
@@ -86,6 +89,23 @@ struct RuntimeTools {
 struct DownloadResult {
     message: String,
     status: String,
+}
+
+/// The versioned, per-user settings persisted beside the historical
+/// plain-text destination file. Field names form the Tauri command contract.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadSettings {
+    schema_version: u8,
+    download_path: String,
+    worker_count: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadSettingsInput {
+    download_path: String,
+    worker_count: usize,
 }
 
 #[derive(Deserialize)]
@@ -210,6 +230,11 @@ struct AggregateProgress {
 #[derive(Clone, Default)]
 struct RuntimeSetupManager {
     install_lock: Arc<Mutex<()>>,
+}
+
+#[derive(Clone, Default)]
+struct SettingsManager {
+    access_lock: Arc<Mutex<()>>,
 }
 
 #[command]
@@ -780,43 +805,39 @@ fn set_runtime_executable_permissions(_path: &Path) -> Result<(), String> {
 }
 
 #[command]
-fn save_download_path(path: String) -> Result<String, String> {
-    let download_path = validate_download_directory(&path)?;
-    fs::write(settings_path()?, path_to_string(&download_path)?)
-        .map_err(|error| format!("Could not save the download destination: {error}"))?;
+async fn save_download_settings(
+    settings: DownloadSettingsInput,
+    state: State<'_, SettingsManager>,
+) -> Result<DownloadSettings, String> {
+    let settings_manager = state.inner().clone();
 
-    path_to_string(&download_path)
+    tauri::async_runtime::spawn_blocking(move || {
+        let _access_guard = settings_manager.access_lock.lock().map_err(|_| {
+            "Saved download settings are unavailable. Restart the app and try again.".to_string()
+        })?;
+        let settings = download_settings_from_input(settings)?;
+        write_download_settings(&settings_path()?, &settings)?;
+        Ok(settings)
+    })
+    .await
+    .map_err(|error| format!("Could not save download settings: {error}"))?
 }
 
 #[command]
-fn get_download_path() -> Result<String, String> {
-    let path = settings_path()?;
+async fn get_download_settings(
+    state: State<'_, SettingsManager>,
+) -> Result<DownloadSettings, String> {
+    let settings_manager = state.inner().clone();
 
-    match fs::read_to_string(path) {
-        Ok(saved_path) => {
-            let saved_path = saved_path.trim();
-            if saved_path.is_empty() {
-                return Err(
-                    "The saved download destination is empty. Choose an existing folder."
-                        .to_string(),
-                );
-            }
-
-            path_to_string(&validate_download_directory(saved_path)?)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let default_path = default_download_directory()?;
-            fs::create_dir_all(&default_path).map_err(|error| {
-                format!("Could not create the default download destination: {error}")
-            })?;
-            path_to_string(&validate_download_directory(
-                default_path.to_string_lossy().as_ref(),
-            )?)
-        }
-        Err(error) => Err(format!(
-            "Could not read the saved download destination: {error}"
-        )),
-    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let _access_guard = settings_manager.access_lock.lock().map_err(|_| {
+            "Saved download settings are unavailable. Restart the app and try again.".to_string()
+        })?;
+        let default_path = default_download_directory()?;
+        load_or_create_download_settings(&settings_path()?, &default_path)
+    })
+    .await
+    .map_err(|error| format!("Could not load saved download settings: {error}"))?
 }
 
 #[command]
@@ -827,6 +848,7 @@ async fn download_audio(
     download_type: DownloadType,
     path: String,
     request_id: String,
+    worker_count: usize,
 ) -> Result<DownloadResult, String> {
     let manager = state.inner().clone();
     let active_job = manager.claim_job()?;
@@ -837,6 +859,7 @@ async fn download_audio(
         let request_id = validate_request_id(request_id)?;
         let url = validate_youtube_url(&url)?;
         let download_path = validate_download_directory(&path)?;
+        let worker_count = validate_worker_count(worker_count)?;
         let tools = resolve_runtime_tools(&task_app)?;
 
         match download_type {
@@ -862,6 +885,7 @@ async fn download_audio(
                         source_index: 1,
                     }],
                     OutputLayout::Single,
+                    MIN_WORKER_COUNT,
                     "Finished downloading the video as an MP3.".to_string(),
                 )
             }
@@ -895,6 +919,7 @@ async fn download_audio(
                         width,
                         include_uploader: true,
                     },
+                    worker_count,
                     "Finished downloading playlist audio as MP3 files.".to_string(),
                 )
             }
@@ -913,6 +938,7 @@ async fn download_podcast(
     url: String,
     path: String,
     request_id: String,
+    worker_count: usize,
 ) -> Result<DownloadResult, String> {
     let manager = state.inner().clone();
     let active_job = manager.claim_job()?;
@@ -923,6 +949,7 @@ async fn download_podcast(
         let request_id = validate_request_id(request_id)?;
         let url = validate_podcast_feed_url(&url)?;
         let download_path = validate_download_directory(&path)?;
+        let worker_count = validate_worker_count(worker_count)?;
         let tools = resolve_runtime_tools(&task_app)?;
         let (job_id, checkpoint_path) =
             checkpoint_path_for("podcast", &url, &download_path, PODCAST_LAYOUT_VERSION)?;
@@ -960,6 +987,7 @@ async fn download_podcast(
                 width,
                 include_uploader: false,
             },
+            worker_count,
             success_message,
         )
     })
@@ -1149,6 +1177,7 @@ fn run_coordinated_download(
     download_path: &Path,
     items: Vec<DownloadItem>,
     output_layout: OutputLayout,
+    worker_count: usize,
     success_message: String,
 ) -> Result<DownloadResult, String> {
     run_coordinated_download_with_worker(
@@ -1160,6 +1189,7 @@ fn run_coordinated_download(
         items,
         output_layout,
         &success_message,
+        worker_count,
         Arc::new(YtDlpDownloadWorker),
         |aggregate| aggregate.emit(app, &job_id, request_id, kind),
     )
@@ -1174,6 +1204,7 @@ fn run_coordinated_download_with_worker<W, F>(
     items: Vec<DownloadItem>,
     output_layout: OutputLayout,
     success_message: &str,
+    worker_count: usize,
     worker: Arc<W>,
     emit_progress: F,
 ) -> Result<DownloadResult, String>
@@ -1193,7 +1224,7 @@ where
 
     let queue = Arc::new(Mutex::new(VecDeque::from(pending)));
     let (sender, receiver) = mpsc::channel();
-    let worker_count = DOWNLOAD_WORKER_LIMIT.min(
+    let worker_count = validate_worker_count(worker_count)?.min(
         queue
             .lock()
             .map_err(|_| "Could not prepare the download queue.".to_string())?
@@ -1658,6 +1689,131 @@ fn clear_checkpoint(path: &Path) -> Result<(), String> {
     }
 }
 
+fn load_or_create_download_settings(
+    path: &Path,
+    default_download_path: &Path,
+) -> Result<DownloadSettings, String> {
+    match fs::read_to_string(path) {
+        Ok(contents) => {
+            let contents = contents.trim();
+            if contents.is_empty() {
+                return Err(
+                    "The saved download destination is empty. Choose an existing folder."
+                        .to_string(),
+                );
+            }
+
+            if contents.starts_with('{') {
+                let settings: DownloadSettings = serde_json::from_str(contents).map_err(|_| {
+                    "Saved download settings are invalid. Choose a folder to save new settings."
+                        .to_string()
+                })?;
+                if settings.schema_version != SETTINGS_SCHEMA_VERSION {
+                    return Err(
+                        "Saved download settings use an unsupported version. Choose a folder to save new settings."
+                            .to_string(),
+                    );
+                }
+
+                return download_settings_from_input(DownloadSettingsInput {
+                    download_path: settings.download_path,
+                    worker_count: settings.worker_count,
+                });
+            }
+
+            // Before versioned settings, this file only held a destination path.
+            // Validate it first and only replace it after the new JSON is complete.
+            let settings = download_settings_from_input(DownloadSettingsInput {
+                download_path: contents.to_string(),
+                worker_count: DEFAULT_WORKER_COUNT,
+            })?;
+            write_download_settings(path, &settings)?;
+            Ok(settings)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(default_download_path).map_err(|error| {
+                format!("Could not create the default download destination: {error}")
+            })?;
+            let settings = download_settings_from_input(DownloadSettingsInput {
+                download_path: path_to_string(default_download_path)?,
+                worker_count: DEFAULT_WORKER_COUNT,
+            })?;
+            write_download_settings(path, &settings)?;
+            Ok(settings)
+        }
+        Err(error) => Err(format!("Could not read saved download settings: {error}")),
+    }
+}
+
+fn download_settings_from_input(input: DownloadSettingsInput) -> Result<DownloadSettings, String> {
+    let download_path = validate_download_directory(&input.download_path)?;
+    let worker_count = validate_worker_count(input.worker_count)?;
+
+    Ok(DownloadSettings {
+        schema_version: SETTINGS_SCHEMA_VERSION,
+        download_path: path_to_string(&download_path)?,
+        worker_count,
+    })
+}
+
+fn write_download_settings(path: &Path, settings: &DownloadSettings) -> Result<(), String> {
+    let contents = serde_json::to_vec(settings)
+        .map_err(|error| format!("Could not prepare download settings: {error}"))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Could not prepare download settings.".to_string())?;
+    let mut temporary_path = None;
+
+    for attempt in 0..10 {
+        let candidate = parent.join(format!(
+            ".yt-dlp-tauri-settings-{}-{}-{attempt}.tmp",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default()
+        ));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                let write_result = file.write_all(&contents).and_then(|()| file.sync_all());
+                drop(file);
+                if let Err(error) = write_result {
+                    let _ = fs::remove_file(&candidate);
+                    return Err(format!("Could not save download settings: {error}"));
+                }
+                temporary_path = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("Could not save download settings: {error}")),
+        }
+    }
+
+    let temporary_path =
+        temporary_path.ok_or_else(|| "Could not create saved download settings.".to_string())?;
+    if let Err(error) = fs::rename(&temporary_path, path) {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(format!("Could not save download settings: {error}"));
+    }
+    sync_settings_directory(parent)
+}
+
+#[cfg(unix)]
+fn sync_settings_directory(path: &Path) -> Result<(), String> {
+    fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("Could not finish saving download settings: {error}"))
+}
+
+#[cfg(not(unix))]
+fn sync_settings_directory(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
 fn settings_path() -> Result<PathBuf, String> {
     dirs::home_dir()
         .map(|home| home.join(SETTINGS_FILE))
@@ -1670,6 +1826,16 @@ fn default_download_directory() -> Result<PathBuf, String> {
         .ok_or_else(|| {
             "Could not determine a default download destination. Choose a folder.".to_string()
         })
+}
+
+fn validate_worker_count(value: usize) -> Result<usize, String> {
+    if !(MIN_WORKER_COUNT..=MAX_WORKER_COUNT).contains(&value) {
+        return Err(format!(
+            "Choose between {MIN_WORKER_COUNT} and {MAX_WORKER_COUNT} concurrent workers."
+        ));
+    }
+
+    Ok(value)
 }
 
 fn validate_download_directory(value: &str) -> Result<PathBuf, String> {
@@ -2032,11 +2198,12 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .manage(DownloadManager::default())
         .manage(RuntimeSetupManager::default())
+        .manage(SettingsManager::default())
         .invoke_handler(tauri::generate_handler![
             get_runtime_setup_status,
             setup_runtime_dependencies,
-            save_download_path,
-            get_download_path,
+            save_download_settings,
+            get_download_settings,
             download_audio,
             download_podcast,
             stop_download,
@@ -2049,12 +2216,14 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        checkpoint_identity, index_width, output_template, parse_download_progress, pending_items,
+        checkpoint_identity, download_settings_from_input, index_width,
+        load_or_create_download_settings, output_template, parse_download_progress, pending_items,
         playlist_items, read_checkpoint, run_coordinated_download_with_worker, runtime_assets_for,
-        sanitize_podcast_folder_title, validate_podcast_feed_url, validate_youtube_url,
-        write_checkpoint, ActiveDownload, AggregateProgress, DownloadCheckpoint, DownloadItem,
-        DownloadManager, DownloadWorker, OutputLayout, PlaylistEntry, PlaylistMetadata,
-        RuntimeTools, WorkerEvent, WorkerResult, CHECKPOINT_SCHEMA_VERSION, DOWNLOAD_WORKER_LIMIT,
+        sanitize_podcast_folder_title, validate_podcast_feed_url, validate_worker_count,
+        validate_youtube_url, write_checkpoint, ActiveDownload, AggregateProgress,
+        DownloadCheckpoint, DownloadItem, DownloadManager, DownloadSettings, DownloadSettingsInput,
+        DownloadWorker, OutputLayout, PlaylistEntry, PlaylistMetadata, RuntimeTools, WorkerEvent,
+        WorkerResult, CHECKPOINT_SCHEMA_VERSION, DEFAULT_WORKER_COUNT, SETTINGS_SCHEMA_VERSION,
     };
     use std::{
         collections::BTreeSet,
@@ -2070,6 +2239,7 @@ mod tests {
     use url::Url;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+    const TEST_WORKER_COUNT: usize = 3;
     static TEST_DIRECTORY_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     struct TestDirectory {
@@ -2372,6 +2542,92 @@ mod tests {
     }
 
     #[test]
+    fn default_download_settings_are_versioned_and_use_four_workers() {
+        let directory = TestDirectory::new();
+        let settings_path = directory.path().join("settings.json");
+        let default_download_path = directory.path().join("audio");
+
+        let settings = load_or_create_download_settings(&settings_path, &default_download_path)
+            .expect("create default settings");
+
+        assert_eq!(settings.schema_version, SETTINGS_SCHEMA_VERSION);
+        assert_eq!(settings.worker_count, DEFAULT_WORKER_COUNT);
+        assert_eq!(
+            settings.download_path,
+            fs::canonicalize(&default_download_path)
+                .expect("canonicalize default download directory")
+                .to_str()
+                .expect("test path is UTF-8")
+        );
+        let saved: DownloadSettings =
+            serde_json::from_slice(&fs::read(&settings_path).expect("read settings"))
+                .expect("read versioned settings JSON");
+        assert_eq!(saved.worker_count, DEFAULT_WORKER_COUNT);
+    }
+
+    #[test]
+    fn legacy_plain_text_destination_migrates_without_changing_its_path() {
+        let directory = TestDirectory::new();
+        let settings_path = directory.path().join("settings");
+        let legacy_download_path = directory.path().join("legacy-audio");
+        fs::create_dir(&legacy_download_path).expect("create legacy download directory");
+        fs::write(
+            &settings_path,
+            legacy_download_path.to_str().expect("test path is UTF-8"),
+        )
+        .expect("write legacy settings");
+
+        let settings = load_or_create_download_settings(&settings_path, directory.path())
+            .expect("migrate legacy settings");
+
+        assert_eq!(settings.worker_count, DEFAULT_WORKER_COUNT);
+        assert_eq!(
+            settings.download_path,
+            fs::canonicalize(&legacy_download_path)
+                .expect("canonicalize legacy directory")
+                .to_str()
+                .expect("test path is UTF-8")
+        );
+        let saved: DownloadSettings =
+            serde_json::from_slice(&fs::read(&settings_path).expect("read migrated settings"))
+                .expect("migrated settings are JSON");
+        assert_eq!(saved.schema_version, SETTINGS_SCHEMA_VERSION);
+        assert_eq!(saved.download_path, settings.download_path);
+    }
+
+    #[test]
+    fn rejects_invalid_worker_counts_from_settings_input() {
+        let directory = TestDirectory::new();
+        let path = directory.path().to_str().expect("test path is UTF-8");
+
+        for worker_count in [0, 9] {
+            assert!(validate_worker_count(worker_count).is_err());
+            assert!(download_settings_from_input(DownloadSettingsInput {
+                download_path: path.to_string(),
+                worker_count,
+            })
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn corrupt_settings_return_an_actionable_error_without_replacing_the_file() {
+        let directory = TestDirectory::new();
+        let settings_path = directory.path().join("settings");
+        let corrupt_contents = "{\"schemaVersion\":1,\"downloadPath\":";
+        fs::write(&settings_path, corrupt_contents).expect("write corrupt settings");
+
+        let error = load_or_create_download_settings(&settings_path, directory.path())
+            .expect_err("corrupt settings should not be accepted");
+
+        assert!(error.contains("Choose a folder"));
+        assert_eq!(
+            fs::read_to_string(&settings_path).expect("read corrupt settings"),
+            corrupt_contents
+        );
+    }
+
+    #[test]
     fn accepts_http_podcast_feed_urls_only() {
         assert!(validate_podcast_feed_url("https://example.com/podcast.rss").is_ok());
         assert!(validate_podcast_feed_url("file:///tmp/podcast.rss").is_err());
@@ -2527,11 +2783,11 @@ mod tests {
     }
 
     #[test]
-    fn coordinator_bounds_workers_runs_each_item_once_and_reports_final_progress() {
+    fn coordinator_honors_the_configured_worker_cap_and_reports_final_progress() {
         let directory = TestDirectory::new();
         let checkpoint_path = directory.path().join("progress.json");
         let download_path = directory.path().to_path_buf();
-        let items = test_items(DOWNLOAD_WORKER_LIMIT + 3);
+        let items = test_items(TEST_WORKER_COUNT + 3);
         let item_count = items.len();
         let manager = DownloadManager::default();
         let active_job = manager.claim_job().expect("claim coordinator job");
@@ -2558,6 +2814,7 @@ mod tests {
                     include_uploader: true,
                 },
                 "done",
+                TEST_WORKER_COUNT,
                 worker,
                 move |aggregate| {
                     progress_for_coordinator
@@ -2568,7 +2825,7 @@ mod tests {
             )
         });
 
-        worker_state.wait_for_started(DOWNLOAD_WORKER_LIMIT);
+        worker_state.wait_for_started(TEST_WORKER_COUNT);
         assert!(manager.claim_job().is_err());
         worker_state.release();
 
@@ -2585,10 +2842,10 @@ mod tests {
         let (max_active, mut started) = worker_state.snapshot();
         started.sort_unstable();
         assert!(
-            max_active <= DOWNLOAD_WORKER_LIMIT,
-            "started {max_active} workers with a cap of {DOWNLOAD_WORKER_LIMIT}"
+            max_active <= TEST_WORKER_COUNT,
+            "started {max_active} workers with a cap of {TEST_WORKER_COUNT}"
         );
-        assert_eq!(max_active, DOWNLOAD_WORKER_LIMIT);
+        assert_eq!(max_active, TEST_WORKER_COUNT);
         assert_eq!(started, (1..=item_count).collect::<Vec<_>>());
 
         let progress = progress.lock().expect("read aggregate progress");
@@ -2597,6 +2854,70 @@ mod tests {
             .windows(2)
             .all(|pair| pair[0].0 <= pair[1].0 && pair[0].1 == pair[1].1));
         assert_eq!(progress.last(), Some(&(item_count, item_count, 0)));
+    }
+
+    #[test]
+    fn resumed_coordinator_retains_the_original_worker_count() {
+        const ORIGINAL_WORKER_COUNT: usize = 2;
+        const LATER_SETTINGS_WORKER_COUNT: usize = 6;
+
+        let directory = TestDirectory::new();
+        let checkpoint_path = directory.path().join("resume.json");
+        let download_path = directory.path().to_path_buf();
+        let items = test_items(ORIGINAL_WORKER_COUNT + 3);
+        let checkpointed_key = items[0].checkpoint_key.clone();
+        write_checkpoint(
+            &checkpoint_path,
+            &DownloadCheckpoint {
+                schema_version: CHECKPOINT_SCHEMA_VERSION,
+                job_id: "resume-worker-count-job".to_string(),
+                completed: BTreeSet::from([checkpointed_key]),
+            },
+        )
+        .expect("seed paused-job checkpoint");
+
+        let manager = DownloadManager::default();
+        let active_job = manager.claim_job().expect("claim resumed coordinator job");
+        let worker_state = Arc::new(ConcurrentWorkerState::default());
+        let worker = Arc::new(ConcurrentWorker {
+            state: worker_state.clone(),
+        });
+        let coordinator_job = active_job.clone();
+        let coordinator_checkpoint_path = checkpoint_path.clone();
+        let tools = test_runtime_tools();
+
+        // A resume request supplies the worker count captured at job start,
+        // not a later setting value. The checkpoint represents the paused job.
+        let coordinator = thread::spawn(move || {
+            run_coordinated_download_with_worker(
+                &coordinator_job,
+                "resume-worker-count-job",
+                &coordinator_checkpoint_path,
+                &tools,
+                &download_path,
+                items,
+                OutputLayout::Indexed {
+                    width: 2,
+                    include_uploader: true,
+                },
+                "done",
+                ORIGINAL_WORKER_COUNT,
+                worker,
+                |_| {},
+            )
+        });
+
+        worker_state.wait_for_started(ORIGINAL_WORKER_COUNT);
+        worker_state.release();
+
+        let result = coordinator.join().expect("join resumed coordinator");
+        let result = result.expect("resumed coordinator should complete");
+        manager.release_job(&active_job);
+
+        let (max_active, _) = worker_state.snapshot();
+        assert_eq!(result.status, "completed");
+        assert_eq!(max_active, ORIGINAL_WORKER_COUNT);
+        assert_ne!(max_active, LATER_SETTINGS_WORKER_COUNT);
     }
 
     #[test]
@@ -2635,6 +2956,7 @@ mod tests {
                 include_uploader: false,
             },
             "done",
+            2,
             worker.clone(),
             |_| {},
         );
@@ -2664,10 +2986,13 @@ mod tests {
         assert!(!checkpoint.completed.contains(&failed_key));
     }
 
-    fn assert_interrupted_coordinator_cleans_or_retains_checkpoints(stop: bool) {
+    fn assert_interrupted_coordinator_cleans_or_retains_checkpoints(
+        stop: bool,
+        worker_count: usize,
+    ) {
         let directory = TestDirectory::new();
         let checkpoint_path = directory.path().join("interrupted.json");
-        let items = test_items(DOWNLOAD_WORKER_LIMIT + 2);
+        let items = test_items(worker_count + 2);
         let retained_key = items[0].checkpoint_key.clone();
         write_checkpoint(
             &checkpoint_path,
@@ -2703,6 +3028,7 @@ mod tests {
                     include_uploader: false,
                 },
                 "done",
+                worker_count,
                 worker,
                 |_| {},
             );
@@ -2710,7 +3036,7 @@ mod tests {
             result
         });
 
-        worker_state.wait_for_started(DOWNLOAD_WORKER_LIMIT);
+        worker_state.wait_for_started(worker_count);
         let requested_job = manager
             .request_interruption(stop)
             .expect("request interruption");
@@ -2724,7 +3050,7 @@ mod tests {
         });
 
         worker_state.permit_interruption_check();
-        worker_state.wait_for_observed_interruption(DOWNLOAD_WORKER_LIMIT);
+        worker_state.wait_for_observed_interruption(worker_count);
         assert!(matches!(
             waiter_receiver.try_recv(),
             Err(mpsc::TryRecvError::Empty)
@@ -2755,12 +3081,12 @@ mod tests {
 
     #[test]
     fn coordinator_pause_interrupts_all_active_workers_and_retains_checkpoints() {
-        assert_interrupted_coordinator_cleans_or_retains_checkpoints(false);
+        assert_interrupted_coordinator_cleans_or_retains_checkpoints(false, 2);
     }
 
     #[test]
     fn coordinator_stop_interrupts_all_active_workers_waits_and_clears_checkpoints() {
-        assert_interrupted_coordinator_cleans_or_retains_checkpoints(true);
+        assert_interrupted_coordinator_cleans_or_retains_checkpoints(true, 2);
     }
 
     #[test]

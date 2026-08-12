@@ -25,6 +25,12 @@ interface DownloadResult {
   status: "completed" | "stopped" | "paused" | "stopping";
 }
 
+interface DownloadSettings {
+  schemaVersion: number;
+  downloadPath: string;
+  workerCount: number;
+}
+
 interface Notice {
   message: string;
   tone: NoticeTone;
@@ -45,9 +51,19 @@ interface StartedDownloadParams {
   url: string;
   downloadType: DownloadType;
   path: string;
+  workerCount: number;
 }
 
 const YOUTUBE_HOSTS = ["youtube.com", "youtu.be", "youtube-nocookie.com"];
+const DEFAULT_WORKER_COUNT = 4;
+const MIN_WORKER_COUNT = 1;
+const MAX_WORKER_COUNT = 8;
+
+function isValidWorkerCount(value: number): boolean {
+  return (
+    Number.isInteger(value) && value >= MIN_WORKER_COUNT && value <= MAX_WORKER_COUNT
+  );
+}
 
 function isYouTubeUrl(value: string): boolean {
   try {
@@ -170,6 +186,7 @@ function SetupScreen({
 function App() {
   const [url, setUrl] = useState("");
   const [downloadPath, setDownloadPath] = useState("");
+  const [workerCount, setWorkerCount] = useState(DEFAULT_WORKER_COUNT);
   const [downloadType, setDownloadType] = useState<DownloadType>("single");
   const [setupPhase, setSetupPhase] = useState<"checking" | "installing" | "ready" | "error">(
     "checking",
@@ -177,8 +194,9 @@ function App() {
   const [setupAttempt, setSetupAttempt] = useState(0);
   const [setupProgress, setSetupProgress] = useState<RuntimeSetupProgress | null>(null);
   const [setupError, setSetupError] = useState<string | null>(null);
-  const [isLoadingPath, setIsLoadingPath] = useState(true);
+  const [isLoadingSettings, setIsLoadingSettings] = useState(true);
   const [isSelectingPath, setIsSelectingPath] = useState(false);
+  const [isSavingWorkerCount, setIsSavingWorkerCount] = useState(false);
   const [isDownloading, setIsDownloading] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
   const [isPausing, setIsPausing] = useState(false);
@@ -269,27 +287,35 @@ function App() {
   useEffect(() => {
     let cancelled = false;
 
-    const loadDownloadPath = async () => {
+    const loadDownloadSettings = async () => {
       try {
-        const savedPath = await invoke<string>("get_download_path");
+        const savedSettings = await invoke<DownloadSettings>("get_download_settings");
+        if (!isValidWorkerCount(savedSettings.workerCount)) {
+          throw new Error(
+            `The saved worker count must be between ${MIN_WORKER_COUNT} and ${MAX_WORKER_COUNT}.`,
+          );
+        }
+
         if (!cancelled) {
-          setDownloadPath(savedPath);
+          setDownloadPath(savedSettings.downloadPath);
+          setWorkerCount(savedSettings.workerCount);
         }
       } catch (error) {
         if (!cancelled) {
+          setWorkerCount(DEFAULT_WORKER_COUNT);
           setNotice({
-            message: `Could not load the saved destination: ${errorMessage(error)}`,
+            message: `Could not load saved download settings: ${errorMessage(error)}`,
             tone: "error",
           });
         }
       } finally {
         if (!cancelled) {
-          setIsLoadingPath(false);
+          setIsLoadingSettings(false);
         }
       }
     };
 
-    void loadDownloadPath();
+    void loadDownloadSettings();
 
     return () => {
       cancelled = true;
@@ -362,9 +388,15 @@ function App() {
         return;
       }
 
-      const savedPath = await invoke<string>("save_download_path", { path });
+      const savedSettings = await invoke<DownloadSettings>("save_download_settings", {
+        settings: {
+          downloadPath: path,
+          workerCount,
+        },
+      });
       resetPauseStateIfNeeded();
-      setDownloadPath(savedPath);
+      setDownloadPath(savedSettings.downloadPath);
+      setWorkerCount(savedSettings.workerCount);
       setNotice({
         message: "Download destination saved.",
         tone: "success",
@@ -379,8 +411,47 @@ function App() {
     }
   };
 
+  const handleWorkerCountChange = async (value: string) => {
+    const nextWorkerCount = Number(value);
+    if (!isValidWorkerCount(nextWorkerCount)) {
+      setNotice({
+        message: `Choose between ${MIN_WORKER_COUNT} and ${MAX_WORKER_COUNT} concurrent workers.`,
+        tone: "error",
+      });
+      return;
+    }
+
+    setIsSavingWorkerCount(true);
+    try {
+      const savedSettings = await invoke<DownloadSettings>("save_download_settings", {
+        settings: {
+          downloadPath,
+          workerCount: nextWorkerCount,
+        },
+      });
+      setDownloadPath(savedSettings.downloadPath);
+      setWorkerCount(savedSettings.workerCount);
+      setNotice({
+        message: "Concurrent worker setting saved.",
+        tone: "success",
+      });
+    } catch (error) {
+      setNotice({
+        message: `Could not save the worker setting: ${errorMessage(error)}`,
+        tone: "error",
+      });
+    } finally {
+      setIsSavingWorkerCount(false);
+    }
+  };
+
   const startDownload = async (params: StartedDownloadParams) => {
-    const { url: startUrl, downloadType: startType, path: startPath } = params;
+    const {
+      url: startUrl,
+      downloadType: startType,
+      path: startPath,
+      workerCount: startWorkerCount,
+    } = params;
     const requestId = createDownloadRequestId();
 
     setIsDownloading(true);
@@ -405,12 +476,14 @@ function App() {
               url: startUrl,
               path: startPath,
               requestId,
+              workerCount: startWorkerCount,
             })
           : await invoke<DownloadResult>("download_audio", {
               url: startUrl,
               downloadType: startType,
               path: startPath,
               requestId,
+              workerCount: startWorkerCount,
             });
 
       if (result.status === "paused") {
@@ -495,7 +568,12 @@ function App() {
       return;
     }
 
-    await startDownload({ url: trimmedUrl, downloadType, path: trimmedPath });
+    await startDownload({
+      url: trimmedUrl,
+      downloadType,
+      path: trimmedPath,
+      workerCount,
+    });
   };
 
   const handleResume = async () => {
@@ -541,7 +619,10 @@ function App() {
     }
   };
 
-  const downloadUnavailable = isLoadingPath || isSelectingPath || isDownloading;
+  const downloadUnavailable =
+    isLoadingSettings || isSelectingPath || isSavingWorkerCount || isDownloading;
+  const workerCountLocked =
+    isLoadingSettings || isSelectingPath || isSavingWorkerCount || isDownloading || isPaused;
   const isPodcast = downloadType === "podcast";
 
   if (setupPhase !== "ready") {
@@ -665,6 +746,33 @@ function App() {
           </fieldset>
 
           <div className="field">
+            <label htmlFor="worker-count">Concurrent playlist and podcast workers</label>
+            <select
+              id="worker-count"
+              name="worker-count"
+              value={workerCount}
+              onChange={(event) => {
+                void handleWorkerCountChange(event.target.value);
+              }}
+              aria-describedby="worker-count-help"
+              disabled={workerCountLocked}
+            >
+              {Array.from(
+                { length: MAX_WORKER_COUNT - MIN_WORKER_COUNT + 1 },
+                (_, index) => MIN_WORKER_COUNT + index,
+              ).map((count) => (
+                <option key={count} value={count}>
+                  {count} {count === 1 ? "worker" : "workers"}
+                </option>
+              ))}
+            </select>
+            <p id="worker-count-help" className="help-text">
+              Playlists and podcast feeds download up to this many items at once. Higher counts
+              use more network and CPU; single videos always use one worker.
+            </p>
+          </div>
+
+          <div className="field">
             <span id="destination-label" className="field-label">
               Download destination
             </span>
@@ -680,7 +788,9 @@ function App() {
                 type="button"
                 className="secondary-button"
                 onClick={handleSelectPath}
-                disabled={isLoadingPath || isDownloading || isSelectingPath}
+                disabled={
+                  isLoadingSettings || isDownloading || isSelectingPath || isSavingWorkerCount
+                }
               >
                 {isSelectingPath ? "Opening…" : "Choose folder"}
               </button>

@@ -33,9 +33,9 @@ shape, or event payload as a cross-layer change: update the Rust command, its
 | --- | --- | --- |
 | `get_runtime_setup_status` | UI to Rust | Returns whether the private runtime is ready and its `ytDlpVersion` |
 | `setup_runtime_dependencies` | UI to Rust | Installs and verifies pinned private `yt-dlp`, `ffmpeg`, and `ffprobe` artifacts |
-| `get_download_path`, `save_download_path` | UI to Rust | Loads or persists the selected download directory |
-| `download_audio` | UI to Rust | Receives `url`, `downloadType` (`single` or `playlist`), `path`, and a per-invocation `requestId` |
-| `download_podcast` | UI to Rust | Receives a public RSS `url`, parent `path`, and a per-invocation `requestId` |
+| `get_download_settings`, `save_download_settings` | UI to Rust | Loads or persists versioned download settings: a selected directory and a worker count from 1 through 8 |
+| `download_audio` | UI to Rust | Receives `url`, `downloadType` (`single` or `playlist`), `path`, `workerCount`, and a per-invocation `requestId` |
+| `download_podcast` | UI to Rust | Receives a public RSS `url`, parent `path`, `workerCount`, and a per-invocation `requestId` |
 | `pause_download`, `stop_download` | UI to Rust | Controls the active download and returns a `DownloadResult` |
 | `runtime-setup-progress` | Rust to UI | Emits setup step, total steps, component, and message |
 | `download-progress` | Rust to UI | Emits job and request IDs, completed/total items, active worker count, optional active item/percentage, and download kind |
