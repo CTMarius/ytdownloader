@@ -72,6 +72,7 @@ next action.
 - Treat URLs and filesystem paths as untrusted. Pass each as its own `Command` argument, avoid shell interpolation, and do not delete or overwrite files outside the intended download location.
 - Avoid logging private local paths, URLs, or full command output unless diagnostics explicitly require it.
 - Keep `yt-dlp` behavior deliberate: preserve audio format/quality and playlist/chapter semantics unless the feature intentionally changes them.
+- Keep the versioned download settings migration-safe: preserve existing destinations, validate the worker count in Rust, and capture a playlist or podcast job's worker count at start so resume uses the original value.
 - Review `src-tauri/capabilities/default.json` and the CSP implications when adding Tauri APIs, plugins, remote access, or web content. Use the narrowest configuration that supports the feature.
 
 ## Testing and QA
@@ -90,6 +91,7 @@ When UI or native behavior changes, also QA the affected flow in `npm run tauri 
 - Empty, malformed, unsupported, and valid URLs.
 - Single-video and playlist download selection.
 - Download-path selection, persistence, and an unavailable/unwritable path.
+- Worker-count persistence and validation, configured worker caps, and pause/resume retaining the job's original worker count.
 - Missing `yt-dlp`, failed installation, failed download, and a successful download.
 - Repeated clicks while a download is in progress and user-visible error/status messages.
 
